@@ -1,0 +1,408 @@
+name: release-macos
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+      - "V*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-notarize:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            file_slug: universal
+            asset_key: macos-universal
+            sparkle_key: macos-sparkle-universal
+            manifest_name: latest-macos.json
+            intel_manifest_name: latest-macos-intel.json
+    env:
+      MACOS_FILE_SLUG: ${{ matrix.file_slug }}
+      MACOS_ASSET_KEY: ${{ matrix.asset_key }}
+      MACOS_SPARKLE_KEY: ${{ matrix.sparkle_key }}
+      MACOS_MANIFEST_NAME: ${{ matrix.manifest_name }}
+      MACOS_INTEL_MANIFEST_NAME: ${{ matrix.intel_manifest_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CMake
+        run: brew install cmake
+
+      - name: Restore Cargo Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Reset wxWidgets CMake Cache
+        run: |
+          set -euo pipefail
+          rm -rf target/release/wxwidgets_cmake_build
+          rm -rf target/release/wxdragon_sys_cmake_build
+
+      - name: Import Developer ID Certificate
+        if: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 != '' && secrets.APPLE_CODESIGN_IDENTITY != '' }}
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export CERT_PATH="$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          python3 -c 'import base64, os, pathlib; pathlib.Path(os.environ["CERT_PATH"]).write_bytes(base64.b64decode(os.environ["APPLE_CERTIFICATE_P12_BASE64"]))'
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Build App Bundle
+        run: |
+          set -euo pipefail
+          APP_NAME="ChatRoute"
+          APP="target/dist/$APP_NAME.app"
+          CONTENTS="$APP/Contents"
+          MACOS="$CONTENTS/MacOS"
+          RESOURCES="$CONTENTS/Resources"
+
+          # Install cross-compilation targets for universal binary
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+          # Build wxWidgets as universal (arm64 + x86_64) and compile for native arch
+          export WX_OSX_ARCHITECTURES="arm64;x86_64"
+          PATH="$(brew --prefix)/bin:$PATH" cargo build --release --features gui --bin chatroute --target aarch64-apple-darwin
+
+          # Compile for Intel (wxWidgets libs are already fat, no rebuild needed)
+          PATH="$(brew --prefix)/bin:$PATH" cargo build --release --features gui --bin chatroute --target x86_64-apple-darwin
+
+          # Create universal binary
+          mkdir -p target/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/chatroute \
+            target/x86_64-apple-darwin/release/chatroute \
+            -output target/release/chatroute
+
+          CARGO_VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$CARGO_VERSION" ]; then
+            echo "Could not read package version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            APP_VERSION="$GITHUB_REF_NAME"
+          else
+            APP_VERSION="V1.0"
+          fi
+          {
+            echo "APP_VERSION=$APP_VERSION"
+            echo "MACOS_DMG_NAME=ChatRoute-$APP_VERSION-macos-$MACOS_FILE_SLUG.dmg"
+            echo "MACOS_APP_ZIP_NAME=ChatRoute-$APP_VERSION-macos-$MACOS_FILE_SLUG.app.zip"
+          } >> "$GITHUB_ENV"
+
+          rm -rf "$APP"
+          mkdir -p "$MACOS" "$RESOURCES/brand"
+          cp "packaging/macos/Info.plist" "$CONTENTS/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${CARGO_VERSION%%[-+]*}" "$CONTENTS/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${GITHUB_RUN_NUMBER:-1}" "$CONTENTS/Info.plist"
+          cp "packaging/macos/AppIcon.icns" "$RESOURCES/AppIcon.icns"
+          cp packaging/brand/*.png "$RESOURCES/brand/"
+          cp "target/release/chatroute" "$MACOS/$APP_NAME"
+          chmod +x "$MACOS/$APP_NAME"
+
+      - name: Sign And Notarize
+        timeout-minutes: 75
+        env:
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          NOTARY_KEYCHAIN_PROFILE: ${{ secrets.NOTARY_KEYCHAIN_PROFILE }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APP="target/dist/ChatRoute.app"
+          DMG="target/dist/ChatRoute.dmg"
+          DMG_STAGING="target/dist/dmg"
+          ZIP="target/dist/${MACOS_APP_ZIP_NAME}"
+          NOTARY_ZIP="target/dist/ChatRoute-notary.zip"
+          ENTITLEMENTS="packaging/macos/entitlements.plist"
+
+          # A public GitHub Release must still be buildable before Apple signing
+          # credentials are available. When the credentials are absent, publish
+          # the same universal app ZIP and DMG without signing or notarization.
+          has_notary_credentials=false
+          if [ -n "${NOTARY_KEYCHAIN_PROFILE:-}" ] || \
+             { [ -n "${APPLE_API_KEY_P8:-}" ] && [ -n "${APPLE_API_KEY_ID:-}" ] && [ -n "${APPLE_API_ISSUER_ID:-}" ]; } || \
+             { [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; }; then
+            has_notary_credentials=true
+          fi
+          if [ -z "${APPLE_CODESIGN_IDENTITY:-}" ] || [ "$has_notary_credentials" != true ]; then
+            echo "Apple signing or notarization credentials are not configured; publishing an unsigned macOS package."
+            ditto -c -k --keepParent "$APP" "$ZIP"
+            rm -rf \
+              target/aarch64-apple-darwin \
+              target/x86_64-apple-darwin \
+              target/release
+            rm -rf "$DMG_STAGING"
+            mkdir -p "$DMG_STAGING"
+            ditto "$APP" "$DMG_STAGING/ChatRoute.app"
+            ln -s /Applications "$DMG_STAGING/Applications"
+            hdiutil create -volname "ChatRoute" -srcfolder "$DMG_STAGING" -ov -format UDZO "$DMG"
+            mv "$DMG" "target/dist/${MACOS_DMG_NAME}"
+            exit 0
+          fi
+
+          if [ -n "${APPLE_API_KEY_P8:-}" ]; then
+            API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+            printf '%s' "$APPLE_API_KEY_P8" > "$API_KEY_PATH"
+            chmod 600 "$API_KEY_PATH"
+            export APPLE_API_KEY_PATH="$API_KEY_PATH"
+          fi
+
+          run_with_timeout() {
+            local timeout_seconds="$1"
+            shift
+            python3 - "$timeout_seconds" "$@" <<'PY'
+          import os
+          import signal
+          import subprocess
+          import sys
+
+          timeout = int(sys.argv[1])
+          command = sys.argv[2:]
+          process = subprocess.Popen(command, start_new_session=True)
+          try:
+              return_code = process.wait(timeout=timeout)
+          except subprocess.TimeoutExpired:
+              print(f"Command timed out after {timeout} seconds: {command[0]}", file=sys.stderr)
+              os.killpg(process.pid, signal.SIGTERM)
+              try:
+                  process.wait(timeout=10)
+              except subprocess.TimeoutExpired:
+                  os.killpg(process.pid, signal.SIGKILL)
+                  process.wait()
+              sys.exit(124)
+          sys.exit(return_code)
+          PY
+          }
+
+          notary_submit() {
+            local path="$1"
+            local -a auth_args
+            if [ -n "${NOTARY_KEYCHAIN_PROFILE:-}" ]; then
+              auth_args=(--keychain-profile "$NOTARY_KEYCHAIN_PROFILE")
+            elif [ -n "${APPLE_API_KEY_ID:-}" ]; then
+              auth_args=(
+                --key "$APPLE_API_KEY_PATH" \
+                --key-id "$APPLE_API_KEY_ID" \
+                --issuer "$APPLE_API_ISSUER_ID"
+              )
+            else
+              auth_args=(
+                --apple-id "$APPLE_ID" \
+                --team-id "$APPLE_TEAM_ID" \
+                --password "$APPLE_APP_SPECIFIC_PASSWORD"
+              )
+            fi
+
+            local attempt status
+            for attempt in 1 2 3; do
+              local -a submit_args=(xcrun notarytool submit "$path" "${auth_args[@]}")
+              if [ "$attempt" -gt 1 ]; then
+                submit_args+=(--no-s3-acceleration)
+              fi
+              echo "Submitting $path for notarization (attempt $attempt/3)..."
+              if run_with_timeout 1200 \
+                "${submit_args[@]}" \
+                --wait --timeout 15m; then
+                return 0
+              else
+                status=$?
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "Notarization attempt $attempt failed with status $status; retrying..." >&2
+                sleep $((attempt * 15))
+              fi
+            done
+            echo "Notarization failed after 3 attempts: $path" >&2
+            return "$status"
+          }
+
+          codesign --force --timestamp --options runtime \
+            --entitlements "$ENTITLEMENTS" \
+            --sign "$APPLE_CODESIGN_IDENTITY" \
+            "$APP"
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" "$NOTARY_ZIP"
+          notary_submit "$NOTARY_ZIP"
+          xcrun stapler staple "$APP"
+          rm -f "$NOTARY_ZIP"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+
+          # The signed app and update ZIP are self-contained now. Universal
+          # builds leave two complete Rust/wxWidgets trees behind, which can
+          # exhaust the hosted runner while hdiutil creates its temporary image.
+          echo "Disk usage before removing build intermediates:"
+          df -h
+          rm -rf \
+            target/aarch64-apple-darwin \
+            target/x86_64-apple-darwin \
+            target/release
+          echo "Disk usage before creating DMG:"
+          df -h
+
+          rm -rf "$DMG_STAGING"
+          mkdir -p "$DMG_STAGING"
+          ditto "$APP" "$DMG_STAGING/ChatRoute.app"
+          ln -s /Applications "$DMG_STAGING/Applications"
+
+          hdiutil create -volname "ChatRoute" -srcfolder "$DMG_STAGING" -ov -format UDZO "$DMG"
+          codesign --force --timestamp --sign "$APPLE_CODESIGN_IDENTITY" "$DMG"
+          notary_submit "$DMG"
+          xcrun stapler staple "$DMG"
+          mv "$DMG" "target/dist/${MACOS_DMG_NAME}"
+          DMG="target/dist/${MACOS_DMG_NAME}"
+
+          xcrun stapler validate "$APP"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type execute --verbose=4 "$APP"
+          spctl --assess --type open --context context:primary-signature --verbose=4 "$DMG"
+
+      - name: Write macOS Update Metadata
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import hashlib
+          from pathlib import Path
+
+          dist = Path("target/dist")
+          dmg_name = os.environ["MACOS_DMG_NAME"]
+          app_zip_name = os.environ["MACOS_APP_ZIP_NAME"]
+          asset_key = os.environ["MACOS_ASSET_KEY"]
+          sparkle_key = os.environ["MACOS_SPARKLE_KEY"]
+          manifest_name = os.environ["MACOS_MANIFEST_NAME"]
+          intel_manifest_name = os.environ["MACOS_INTEL_MANIFEST_NAME"]
+          dmg_path = dist / dmg_name
+          app_zip_path = dist / app_zip_name
+          release_tag = os.environ["RELEASE_TAG"]
+          repository = os.environ["RELEASE_REPOSITORY"]
+          release_url = f"https://github.com/{repository}/releases/tag/{release_tag}"
+          download_base_url = f"https://github.com/{repository}/releases/download/{release_tag}"
+          update_notes = Path("UPDATE_NOTES.md").read_text(encoding="utf-8").strip()
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          manifest = {
+              "version": release_tag,
+              "releaseUrl": release_url,
+              "notes": update_notes,
+              "assets": {
+                  asset_key: {
+                      "type": "dmg",
+                      "url": f"{download_base_url}/{dmg_name}",
+                      "sha256": sha256(dmg_path),
+                      "size": dmg_path.stat().st_size,
+                      "signed": True,
+                      "notarized": True,
+                  },
+                  sparkle_key: {
+                      "type": "app-zip",
+                      "url": f"{download_base_url}/{app_zip_name}",
+                      "sha256": sha256(app_zip_path),
+                      "size": app_zip_path.stat().st_size,
+                      "signed": True,
+                      "notarized": True,
+                  },
+              },
+          }
+          Path(f"target/dist/{manifest_name}").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          intel_manifest = {
+              "version": release_tag,
+              "releaseUrl": release_url,
+              "notes": update_notes,
+              "assets": {
+                  "macos-intel": manifest["assets"][asset_key],
+                  "macos-sparkle-intel": manifest["assets"][sparkle_key],
+              },
+          }
+          Path(f"target/dist/{intel_manifest_name}").write_text(
+              json.dumps(intel_manifest, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatRoute-macOS-${{ matrix.file_slug }}
+          path: |
+            target/dist/ChatRoute-*-macos-${{ matrix.file_slug }}.dmg
+            target/dist/ChatRoute-*-macos-${{ matrix.file_slug }}.app.zip
+            target/dist/${{ matrix.manifest_name }}
+            target/dist/${{ matrix.intel_manifest_name }}
+
+      - name: Verify Companion Update Manifests
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          required=(latest-windows.json latest-linux.json)
+          for attempt in {1..30}; do
+            assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' 2>/dev/null || true)"
+            missing=()
+            for name in "${required[@]}"; do
+              if ! grep -Fxq "$name" <<<"$assets"; then
+                missing+=("$name")
+              fi
+            done
+            if [ "${#missing[@]}" -eq 0 ]; then
+              echo "All companion update manifests are available."
+              exit 0
+            fi
+            echo "Waiting for companion manifests: ${missing[*]} (attempt $attempt/30)"
+            sleep 20
+          done
+          echo "Release is incomplete; refusing to promote it to Latest." >&2
+          exit 1
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          overwrite_files: true
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ contains(github.ref_name, '-') && 'false' || 'true' }}
+          files: |
+            target/dist/ChatRoute-*-macos-${{ matrix.file_slug }}.dmg
+            target/dist/ChatRoute-*-macos-${{ matrix.file_slug }}.app.zip
+            target/dist/${{ matrix.manifest_name }}
+            target/dist/${{ matrix.intel_manifest_name }}

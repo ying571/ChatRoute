@@ -1,0 +1,3181 @@
+use std::{
+    collections::HashSet,
+    process::Command,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, anyhow, bail};
+use futures_util::{SinkExt, StreamExt};
+use serde::{Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use url::{Host, Url};
+
+use crate::chain_log;
+
+const DEFAULT_CDP_PORT: u16 = 9335;
+const CODEX_APP_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const EARLY_ATTACH_TIMEOUT: Duration = Duration::from_secs(8);
+const EARLY_ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const ENHANCED_INJECTION_TIMEOUT: Duration = Duration::from_secs(45);
+// The injected script retries internally for about 42 seconds. Re-run it only
+// after that window so a cold renderer does not accumulate retry timers.
+const ENHANCED_SCRIPT_RETRY_INTERVAL: Duration = Duration::from_secs(43);
+const ENHANCED_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const ENHANCED_SCRIPT_VERSION: u64 = 21;
+type CdpSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[derive(Default)]
+struct RetainedCdpSessions {
+    browser: Option<tokio::task::JoinHandle<()>>,
+    page: Option<tokio::task::JoinHandle<()>>,
+}
+
+static ENHANCED_CDP_SESSIONS: OnceLock<Mutex<RetainedCdpSessions>> = OnceLock::new();
+const SUPPORTED_FEATURE_GATES: &[&str] = &[
+    "1042620455",
+    "4114442250",
+    "410065390",
+    "2296472986",
+    "3446105535",
+];
+const LEGACY_CHATROUTE_FEATURE_GATES: &[&str] = &[
+    "1834314516",
+    "1714131075",
+    "72045066",
+    "2982604767",
+    "2177625257",
+    "3657624089",
+    "3245360288",
+    "3646210497",
+    "1186680773",
+    "1042620455",
+    "4114442250",
+    "824038554",
+    "410065390",
+    "2296472986",
+];
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnhancedLaunchReport {
+    pub port: u16,
+    pub launched: bool,
+    pub target_id: String,
+    pub early_attach_applied: bool,
+    pub early_attach_target_id: Option<String>,
+    pub early_attach_elapsed_ms: Option<u64>,
+    pub early_attach_fallback: Option<String>,
+    pub available_models: Vec<String>,
+    pub use_hidden_models: bool,
+    pub key_gates_enabled: usize,
+    pub i18n_enabled: bool,
+    pub fast_initialize_applied: bool,
+    pub fast_initialize_source: Option<String>,
+    pub local_initialize_installed: bool,
+    pub local_initialize_active: bool,
+    pub local_initialize_url: Option<String>,
+    pub local_initialize_error: Option<String>,
+    pub local_base_available: bool,
+    pub bootstrap_intercepted: bool,
+    pub bootstrap_source: Option<String>,
+    pub model_config_id: Option<String>,
+    pub model_config_source: Option<String>,
+    pub model_config_supported: bool,
+    pub i18n_layer_id: Option<String>,
+    pub i18n_layer_source: Option<String>,
+    pub i18n_layer_supported: bool,
+    pub official_base_available: bool,
+    pub compatibility_adapters: Vec<String>,
+    pub compatibility_failure: Option<String>,
+    pub store_source: Option<String>,
+    pub script_attempts: u64,
+    pub routes_mounted: bool,
+    pub renderer_ready_ms: Option<u64>,
+    pub plugin_catalog_bridge_installed: bool,
+    pub plugin_catalog_dispatch_patched: bool,
+    pub plugin_catalog_responses_adapted: u64,
+    pub plugin_catalog_cache_refresh_attempted: bool,
+    pub plugin_catalog_cache_refreshed: bool,
+    pub plugin_catalog_cache_refresh_error: Option<String>,
+    pub startup_elapsed_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnhancedLaunchPreflight {
+    pub running: bool,
+}
+
+pub async fn preflight() -> Result<EnhancedLaunchPreflight> {
+    let result = tokio::task::spawn_blocking(codex_app_is_running)
+        .await
+        .context("检测 Codex App 进程任务失败")?;
+    let running = match result {
+        Ok(running) => running,
+        Err(err) => {
+            chain_log::write_line(format!(
+                "[codex_app_enhanced] event=preflight_failed error={err}"
+            ));
+            return Err(err.context("检测 Codex App 进程失败"));
+        }
+    };
+    chain_log::write_line(format!(
+        "[codex_app_enhanced] event=preflight_complete running={running}"
+    ));
+    Ok(EnhancedLaunchPreflight { running })
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CdpTarget {
+    id: String,
+    #[serde(rename = "type")]
+    target_type: String,
+    url: String,
+    web_socket_debugger_url: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CdpBrowserVersion {
+    web_socket_debugger_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachedTarget {
+    session_id: String,
+    target_id: String,
+    target_type: String,
+    url: String,
+    waiting_for_debugger: bool,
+}
+
+struct EarlyBrowserSession {
+    socket: CdpSocket,
+    command_id: u64,
+    target_id: String,
+    applied: bool,
+    elapsed_ms: u64,
+}
+
+#[derive(Default)]
+struct EarlyAttachDiagnostics {
+    applied: bool,
+    target_id: Option<String>,
+    elapsed_ms: Option<u64>,
+    fallback: Option<String>,
+}
+
+pub async fn launch_and_inject(
+    models: Vec<String>,
+    backend_url: &str,
+) -> Result<EnhancedLaunchReport> {
+    let started = Instant::now();
+    let models = normalized_models(models);
+    if models.is_empty() {
+        bail!("Codex 可见模型列表为空，请先在 Codex 接入页面保存模型");
+    }
+    chain_log::write_line(format!(
+        "[codex_app_enhanced] event=launch_start model_count={}",
+        models.len()
+    ));
+    crate::codex_app_config::prepare_codex_app_config_recovery_snapshot(None)
+        .context("准备 Codex 配置恢复快照失败")?;
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+    let source = enhanced_statsig_script(&models, backend_url)?;
+    let mut launched = false;
+    let mut early_attach = EarlyAttachDiagnostics::default();
+    let app_running = tokio::task::spawn_blocking(codex_app_is_running)
+        .await
+        .context("检测 Codex App 进程失败")??;
+    let target = if app_running {
+        match find_app_target(&client, DEFAULT_CDP_PORT).await? {
+            Some(target) => {
+                crate::codex_app_config::configure_gui_direct_api_base(backend_url)
+                    .map_err(|err| anyhow!("配置 CODEX_API_BASE_URL 失败: {err}"))?;
+                target
+            }
+            None => bail!("Codex App 正在运行。请先完全退出，再使用增强模式启动 Codex"),
+        }
+    } else {
+        crate::codex_app_config::configure_gui_direct_api_base(backend_url)
+            .map_err(|err| anyhow!("配置 CODEX_API_BASE_URL 失败: {err}"))?;
+        let early_attach_blocked = match find_browser_websocket_url(&client, DEFAULT_CDP_PORT).await
+        {
+            Ok(Some(_)) => Some(format!(
+                "本地端口 {DEFAULT_CDP_PORT} 在 Codex 启动前已被 CDP 服务占用"
+            )),
+            Ok(None) => None,
+            Err(err) => Some(format!("检查本地 CDP 端口失败: {err}")),
+        };
+        launch_codex_app(DEFAULT_CDP_PORT).await?;
+        launched = true;
+        if let Some(fallback) = early_attach_blocked {
+            chain_log::write_line(format!(
+                "[codex_app_enhanced] event=early_attach_fallback error={fallback}"
+            ));
+            early_attach.fallback = Some(fallback);
+        } else {
+            match attach_to_initial_renderer(&client, DEFAULT_CDP_PORT, &source).await {
+                Ok(session) => {
+                    early_attach.applied = session.applied;
+                    early_attach.target_id = Some(session.target_id.clone());
+                    early_attach.elapsed_ms = Some(session.elapsed_ms);
+                    if !session.applied {
+                        early_attach.fallback =
+                            Some("renderer 在 browser CDP 挂载前已经开始运行".to_string());
+                    }
+                    chain_log::write_line(format!(
+                        "[codex_app_enhanced] event=early_attach_ready applied={} elapsed_ms={} target_id={}",
+                        session.applied, session.elapsed_ms, session.target_id
+                    ));
+                    retain_browser_cdp_session(session, source.clone());
+                }
+                Err(err) => {
+                    let fallback = err.to_string();
+                    chain_log::write_line(format!(
+                        "[codex_app_enhanced] event=early_attach_fallback error={fallback}"
+                    ));
+                    early_attach.fallback = Some(fallback);
+                }
+            }
+        }
+        wait_for_app_target(&client, DEFAULT_CDP_PORT).await?
+    };
+    chain_log::write_line(format!(
+        "[codex_app_enhanced] event=target_ready elapsed_ms={} launched={} target_id={} early_attach_applied={}",
+        started.elapsed().as_millis(),
+        launched,
+        target.id,
+        early_attach.applied
+    ));
+
+    let (target, status) =
+        inject_until_ready(&client, DEFAULT_CDP_PORT, target, &models, &source).await?;
+    chain_log::write_line(format!(
+        "[codex_app_enhanced] event=injection_applied elapsed_ms={} target_id={}",
+        started.elapsed().as_millis(),
+        target.id
+    ));
+    let startup_elapsed_ms = started.elapsed().as_millis() as u64;
+    chain_log::write_line(format!(
+        "[codex_app_enhanced] event=config_ready elapsed_ms={startup_elapsed_ms} early_attach_applied={} early_attach_target_id={} early_attach_elapsed_ms={} early_attach_fallback={} i18n_enabled={} fast_initialize_applied={} fast_initialize_source={} local_initialize_installed={} local_initialize_active={} local_initialize_url={} local_initialize_error={} local_base_available={} routes_mounted={} renderer_ready_ms={} plugin_catalog_bridge_installed={} plugin_catalog_dispatch_patched={} plugin_catalog_responses_adapted={} plugin_catalog_cache_refresh_attempted={} plugin_catalog_cache_refreshed={} plugin_catalog_cache_refresh_error={} bootstrap_intercepted={} bootstrap_source={} model_config_id={} model_config_source={} model_config_supported={} i18n_layer_id={} i18n_layer_source={} i18n_layer_supported={} official_base_available={} compatibility_adapters={} compatibility_failure={} store_source={} script_attempts={}",
+        early_attach.applied,
+        early_attach.target_id.as_deref().unwrap_or("none"),
+        early_attach
+            .elapsed_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        early_attach.fallback.as_deref().unwrap_or("none"),
+        status.i18n_enabled,
+        status.fast_initialize_applied,
+        status.fast_initialize_source.as_deref().unwrap_or("none"),
+        status.local_initialize_installed,
+        status.local_initialize_active,
+        status.local_initialize_url.as_deref().unwrap_or("none"),
+        status.local_initialize_error.as_deref().unwrap_or("none"),
+        status.local_base_available,
+        status.routes_mounted,
+        status
+            .renderer_ready_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        status.plugin_catalog_bridge_installed,
+        status.plugin_catalog_dispatch_patched,
+        status.plugin_catalog_responses_adapted,
+        status.plugin_catalog_cache_refresh_attempted,
+        status.plugin_catalog_cache_refreshed,
+        status
+            .plugin_catalog_cache_refresh_error
+            .as_deref()
+            .unwrap_or("none"),
+        status.bootstrap_intercepted,
+        status.bootstrap_source.as_deref().unwrap_or("none"),
+        status.model_config_id.as_deref().unwrap_or("none"),
+        status.model_config_source.as_deref().unwrap_or("none"),
+        status.model_config_supported,
+        status.i18n_layer_id.as_deref().unwrap_or("none"),
+        status.i18n_layer_source.as_deref().unwrap_or("none"),
+        status.i18n_layer_supported,
+        status.official_base_available,
+        status.compatibility_adapters.join(","),
+        status.compatibility_failure.as_deref().unwrap_or("none"),
+        status.store_source.as_deref().unwrap_or("none"),
+        status.script_attempts
+    ));
+
+    Ok(EnhancedLaunchReport {
+        port: DEFAULT_CDP_PORT,
+        launched,
+        target_id: target.id,
+        early_attach_applied: early_attach.applied,
+        early_attach_target_id: early_attach.target_id,
+        early_attach_elapsed_ms: early_attach.elapsed_ms,
+        early_attach_fallback: early_attach.fallback,
+        available_models: status.available_models,
+        use_hidden_models: status.use_hidden_models,
+        key_gates_enabled: status.key_gates_enabled,
+        i18n_enabled: status.i18n_enabled,
+        fast_initialize_applied: status.fast_initialize_applied,
+        fast_initialize_source: status.fast_initialize_source,
+        local_initialize_installed: status.local_initialize_installed,
+        local_initialize_active: status.local_initialize_active,
+        local_initialize_url: status.local_initialize_url,
+        local_initialize_error: status.local_initialize_error,
+        local_base_available: status.local_base_available,
+        bootstrap_intercepted: status.bootstrap_intercepted,
+        bootstrap_source: status.bootstrap_source,
+        model_config_id: status.model_config_id,
+        model_config_source: status.model_config_source,
+        model_config_supported: status.model_config_supported,
+        i18n_layer_id: status.i18n_layer_id,
+        i18n_layer_source: status.i18n_layer_source,
+        i18n_layer_supported: status.i18n_layer_supported,
+        official_base_available: status.official_base_available,
+        compatibility_adapters: status.compatibility_adapters,
+        compatibility_failure: status.compatibility_failure,
+        store_source: status.store_source,
+        script_attempts: status.script_attempts,
+        routes_mounted: status.routes_mounted,
+        renderer_ready_ms: status.renderer_ready_ms,
+        plugin_catalog_bridge_installed: status.plugin_catalog_bridge_installed,
+        plugin_catalog_dispatch_patched: status.plugin_catalog_dispatch_patched,
+        plugin_catalog_responses_adapted: status.plugin_catalog_responses_adapted,
+        plugin_catalog_cache_refresh_attempted: status.plugin_catalog_cache_refresh_attempted,
+        plugin_catalog_cache_refreshed: status.plugin_catalog_cache_refreshed,
+        plugin_catalog_cache_refresh_error: status.plugin_catalog_cache_refresh_error,
+        startup_elapsed_ms,
+    })
+}
+
+fn normalized_models(models: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    models
+        .into_iter()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty() && seen.insert(model.clone()))
+        .collect()
+}
+
+async fn find_app_target(client: &reqwest::Client, port: u16) -> Result<Option<CdpTarget>> {
+    let Some(targets) = fetch_cdp_json::<Vec<CdpTarget>>(client, port, "/json/list").await? else {
+        return Ok(None);
+    };
+    Ok(targets.into_iter().find(|target| {
+        target.target_type == "page"
+            && target.url.starts_with("app://")
+            && target.web_socket_debugger_url.is_some()
+    }))
+}
+
+async fn wait_for_app_target(client: &reqwest::Client, port: u16) -> Result<CdpTarget> {
+    let deadline = tokio::time::Instant::now() + CODEX_APP_READY_TIMEOUT;
+    loop {
+        if let Some(target) = find_app_target(client, port).await? {
+            return Ok(target);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("Codex App 未在 30 秒内开放本地 CDP 端口 {port}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn find_browser_websocket_url(client: &reqwest::Client, port: u16) -> Result<Option<String>> {
+    let Some(version) = fetch_cdp_json::<CdpBrowserVersion>(client, port, "/json/version").await?
+    else {
+        return Ok(None);
+    };
+    let Some(raw) = version.web_socket_debugger_url.as_deref() else {
+        return Ok(None);
+    };
+    Ok(Some(validated_loopback_websocket_url(
+        raw,
+        port,
+        "Codex browser",
+    )?))
+}
+
+fn cdp_http_urls(port: u16, path: &str) -> [String; 2] {
+    let path = path.trim_start_matches('/');
+    [
+        format!("http://127.0.0.1:{port}/{path}"),
+        format!("http://[::1]:{port}/{path}"),
+    ]
+}
+
+async fn fetch_cdp_json<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    port: u16,
+    path: &str,
+) -> Result<Option<T>> {
+    let mut parse_error = None;
+    for url in cdp_http_urls(port, path) {
+        let response = match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(_) | Err(_) => continue,
+        };
+        match response.json::<T>().await {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) => parse_error = Some((url, error)),
+        }
+    }
+
+    if let Some((url, error)) = parse_error {
+        return Err(error).with_context(|| format!("解析 Codex CDP 响应失败: {url}"));
+    }
+    Ok(None)
+}
+
+async fn attach_to_initial_renderer(
+    client: &reqwest::Client,
+    port: u16,
+    source: &str,
+) -> Result<EarlyBrowserSession> {
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + EARLY_ATTACH_TIMEOUT;
+    let websocket_url = loop {
+        if let Some(url) = find_browser_websocket_url(client, port).await? {
+            break url;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("Codex browser CDP 未在早期挂载时限内开放");
+        }
+        tokio::time::sleep(EARLY_ATTACH_POLL_INTERVAL).await;
+    };
+    let (mut socket, _) = connect_async(websocket_url)
+        .await
+        .context("连接 Codex browser CDP 失败")?;
+    let mut command_id = 1_u64;
+    let enable_id = send_cdp_request(
+        &mut socket,
+        &mut command_id,
+        None,
+        "Target.setAutoAttach",
+        json!({
+            "autoAttach": true,
+            "waitForDebuggerOnStart": true,
+            "flatten": true,
+        }),
+    )
+    .await?;
+    let mut auto_attach_enabled = false;
+    let mut renderer = None::<AttachedTarget>;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            bail!("Codex browser CDP 已连接，但未及时捕获 renderer");
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let message = tokio::time::timeout(remaining, socket.next())
+            .await
+            .context("等待 Codex renderer 超时")?
+            .context("Codex browser CDP 在 renderer 出现前关闭")??;
+        match message {
+            Message::Ping(payload) => socket.send(Message::Pong(payload)).await?,
+            Message::Text(text) => {
+                let message: Value = serde_json::from_str(&text)?;
+                if message.get("id").and_then(Value::as_u64) == Some(enable_id) {
+                    if let Some(error) = message.get("error") {
+                        bail!("CDP Target.setAutoAttach 失败: {error}");
+                    }
+                    auto_attach_enabled = true;
+                }
+                if let Some(target) = attached_target_from_event(&message) {
+                    let is_renderer = is_codex_renderer_target(&target);
+                    install_on_attached_target(&mut socket, &mut command_id, &target, source)
+                        .await?;
+                    if is_renderer && renderer.is_none() {
+                        renderer = Some(target);
+                    }
+                }
+                if let Some(error) = cdp_response_error(&message) {
+                    chain_log::write_line(format!(
+                        "[codex_app_enhanced] event=browser_cdp_command_error error={error}"
+                    ));
+                }
+            }
+            Message::Close(_) => bail!("Codex browser CDP 在 renderer 出现前关闭"),
+            _ => {}
+        }
+        if auto_attach_enabled && let Some(target) = renderer.take() {
+            return Ok(EarlyBrowserSession {
+                socket,
+                command_id,
+                target_id: target.target_id,
+                applied: target.waiting_for_debugger,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+    }
+}
+
+fn attached_target_from_event(message: &Value) -> Option<AttachedTarget> {
+    if message.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget") {
+        return None;
+    }
+    let params = message.get("params")?;
+    let target = params.get("targetInfo")?;
+    Some(AttachedTarget {
+        session_id: params.get("sessionId")?.as_str()?.to_string(),
+        target_id: target.get("targetId")?.as_str()?.to_string(),
+        target_type: target.get("type")?.as_str()?.to_string(),
+        url: target
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        waiting_for_debugger: params
+            .get("waitingForDebugger")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn is_codex_renderer_target(target: &AttachedTarget) -> bool {
+    target.target_type == "page"
+        && (target.url.starts_with("app://")
+            || target.url.is_empty()
+            || target.url == "about:blank")
+}
+
+fn attached_target_commands(target: &AttachedTarget, source: &str) -> Vec<(&'static str, Value)> {
+    if !is_codex_renderer_target(target) {
+        return target
+            .waiting_for_debugger
+            .then(|| vec![("Runtime.runIfWaitingForDebugger", json!({}))])
+            .unwrap_or_default();
+    }
+    if target.waiting_for_debugger {
+        vec![
+            (
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": source }),
+            ),
+            ("Runtime.runIfWaitingForDebugger", json!({})),
+        ]
+    } else {
+        vec![
+            (
+                "Runtime.evaluate",
+                json!({ "expression": source, "returnByValue": true }),
+            ),
+            (
+                "Page.addScriptToEvaluateOnNewDocument",
+                json!({ "source": source }),
+            ),
+        ]
+    }
+}
+
+async fn install_on_attached_target(
+    socket: &mut CdpSocket,
+    command_id: &mut u64,
+    target: &AttachedTarget,
+    source: &str,
+) -> Result<()> {
+    for (method, params) in attached_target_commands(target, source) {
+        send_cdp_request(socket, command_id, Some(&target.session_id), method, params).await?;
+    }
+    if is_codex_renderer_target(target) {
+        chain_log::write_line(format!(
+            "[codex_app_enhanced] event=browser_target_injected target_id={} url={} waiting_for_debugger={}",
+            target.target_id, target.url, target.waiting_for_debugger
+        ));
+    }
+    Ok(())
+}
+
+async fn send_cdp_request(
+    socket: &mut CdpSocket,
+    command_id: &mut u64,
+    session_id: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Result<u64> {
+    let id = *command_id;
+    *command_id += 1;
+    let request = cdp_request_value(id, session_id, method, params);
+    socket
+        .send(Message::Text(request.to_string().into()))
+        .await?;
+    Ok(id)
+}
+
+fn cdp_request_value(id: u64, session_id: Option<&str>, method: &str, params: Value) -> Value {
+    let mut request = json!({ "id": id, "method": method, "params": params });
+    if let Some(session_id) = session_id {
+        request["sessionId"] = Value::String(session_id.to_string());
+    }
+    request
+}
+
+fn cdp_response_error(message: &Value) -> Option<String> {
+    let id = message.get("id")?.as_u64()?;
+    let error = message.get("error")?;
+    Some(format!("id={id} {error}"))
+}
+
+fn validated_loopback_websocket_url(raw: &str, expected_port: u16, label: &str) -> Result<String> {
+    let url = Url::parse(raw)?;
+    let loopback = match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    if url.scheme() != "ws" || !loopback || url.port() != Some(expected_port) {
+        bail!("拒绝连接非本机 {label} CDP 地址: {raw}");
+    }
+    Ok(raw.to_string())
+}
+
+fn validated_websocket_url(target: &CdpTarget, expected_port: u16) -> Result<String> {
+    let raw = target
+        .web_socket_debugger_url
+        .as_deref()
+        .context("Codex CDP target 缺少 WebSocket 地址")?;
+    validated_loopback_websocket_url(raw, expected_port, "Codex page")
+}
+
+fn same_cdp_target(left: &CdpTarget, right: &CdpTarget) -> bool {
+    left.id == right.id && left.web_socket_debugger_url == right.web_socket_debugger_url
+}
+
+struct ActiveInjection {
+    target: CdpTarget,
+    socket: CdpSocket,
+    command_id: u64,
+    installed_at: Instant,
+}
+
+async fn connect_and_install(
+    target: &CdpTarget,
+    port: u16,
+    source: &str,
+) -> Result<ActiveInjection> {
+    let websocket_url = validated_websocket_url(target, port)?;
+    let (mut socket, _) = connect_async(websocket_url)
+        .await
+        .context("连接 Codex App CDP 失败")?;
+    let mut command_id = 1_u64;
+    for (method, params) in enhanced_script_install_commands(source) {
+        let result = cdp_command(&mut socket, &mut command_id, method, params).await?;
+        if method == "Runtime.evaluate" {
+            ensure_runtime_evaluation_succeeded(&result)?;
+        }
+    }
+    chain_log::write_line(format!(
+        "[codex_app_enhanced] event=script_installed reload=false target_id={}",
+        target.id
+    ));
+    Ok(ActiveInjection {
+        target: target.clone(),
+        socket,
+        command_id,
+        installed_at: Instant::now(),
+    })
+}
+
+async fn reapply_script(active: &mut ActiveInjection, source: &str) -> Result<()> {
+    let result = cdp_command(
+        &mut active.socket,
+        &mut active.command_id,
+        "Runtime.evaluate",
+        json!({
+            "expression": source,
+            "returnByValue": true,
+        }),
+    )
+    .await?;
+    ensure_runtime_evaluation_succeeded(&result)?;
+    active.installed_at = Instant::now();
+    chain_log::write_line(format!(
+        "[codex_app_enhanced] event=script_retry target_id={}",
+        active.target.id
+    ));
+    Ok(())
+}
+
+fn enhanced_script_install_commands(source: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "Runtime.evaluate",
+            json!({
+                "expression": source,
+                "returnByValue": true,
+            }),
+        ),
+        (
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": source }),
+        ),
+    ]
+}
+
+fn ensure_runtime_evaluation_succeeded(result: &Value) -> Result<()> {
+    let Some(exception) = result.get("exceptionDetails") else {
+        return Ok(());
+    };
+    let message = exception
+        .pointer("/exception/description")
+        .and_then(Value::as_str)
+        .or_else(|| exception.get("text").and_then(Value::as_str))
+        .unwrap_or("unknown JavaScript error");
+    bail!("Codex App 增强脚本执行失败: {message}")
+}
+
+fn retain_page_cdp_session(mut socket: CdpSocket) {
+    let handle = tokio::spawn(async move {
+        while let Some(message) = socket.next().await {
+            match message {
+                Ok(Message::Ping(payload)) => {
+                    if socket.send(Message::Pong(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+    let sessions = ENHANCED_CDP_SESSIONS.get_or_init(|| Mutex::new(RetainedCdpSessions::default()));
+    let mut retained = sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(previous) = retained.page.replace(handle) {
+        previous.abort();
+    }
+}
+
+fn retain_browser_cdp_session(session: EarlyBrowserSession, source: String) {
+    let handle = tokio::spawn(async move {
+        let mut socket = session.socket;
+        let mut command_id = session.command_id;
+        while let Some(message) = socket.next().await {
+            match message {
+                Ok(Message::Ping(payload)) => {
+                    if socket.send(Message::Pong(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Message::Text(text)) => {
+                    let Ok(message) = serde_json::from_str::<Value>(&text) else {
+                        continue;
+                    };
+                    if let Some(target) = attached_target_from_event(&message)
+                        && let Err(err) = install_on_attached_target(
+                            &mut socket,
+                            &mut command_id,
+                            &target,
+                            &source,
+                        )
+                        .await
+                    {
+                        chain_log::write_line(format!(
+                            "[codex_app_enhanced] event=browser_target_injection_failed target_id={} error={err}",
+                            target.target_id
+                        ));
+                        break;
+                    }
+                    if let Some(error) = cdp_response_error(&message) {
+                        chain_log::write_line(format!(
+                            "[codex_app_enhanced] event=browser_cdp_command_error error={error}"
+                        ));
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+    let sessions = ENHANCED_CDP_SESSIONS.get_or_init(|| Mutex::new(RetainedCdpSessions::default()));
+    let mut retained = sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(previous) = retained.browser.replace(handle) {
+        previous.abort();
+    }
+}
+
+async fn cdp_command<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    command_id: &mut u64,
+    method: &str,
+    params: Value,
+) -> Result<Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let id = *command_id;
+    *command_id += 1;
+    socket
+        .send(Message::Text(
+            json!({ "id": id, "method": method, "params": params })
+                .to_string()
+                .into(),
+        ))
+        .await?;
+    while let Some(message) = socket.next().await {
+        let message = message?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let response: Value = serde_json::from_str(&text)?;
+        if response.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if let Some(error) = response.get("error") {
+            bail!("CDP {method} 失败: {error}");
+        }
+        return Ok(response.get("result").cloned().unwrap_or(Value::Null));
+    }
+    bail!("Codex App 在响应 CDP {method} 前关闭了连接")
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InjectedStatus {
+    script_installed: bool,
+    script_applied: bool,
+    script_version: Option<u64>,
+    ready: bool,
+    available_models: Vec<String>,
+    use_hidden_models: bool,
+    key_gates_enabled: usize,
+    i18n_enabled: bool,
+    fast_initialize_applied: bool,
+    fast_initialize_source: Option<String>,
+    local_initialize_installed: bool,
+    local_initialize_active: bool,
+    local_initialize_url: Option<String>,
+    local_initialize_error: Option<String>,
+    local_base_available: bool,
+    bootstrap_intercepted: bool,
+    bootstrap_source: Option<String>,
+    model_config_id: Option<String>,
+    model_config_source: Option<String>,
+    model_config_supported: bool,
+    i18n_layer_id: Option<String>,
+    i18n_layer_source: Option<String>,
+    i18n_layer_supported: bool,
+    official_base_available: bool,
+    compatibility_adapters: Vec<String>,
+    compatibility_failure: Option<String>,
+    store_source: Option<String>,
+    script_attempts: u64,
+    routes_mounted: bool,
+    renderer_ready_ms: Option<u64>,
+    plugin_catalog_bridge_installed: bool,
+    plugin_catalog_dispatch_patched: bool,
+    plugin_catalog_responses_adapted: u64,
+    plugin_catalog_cache_refresh_attempted: bool,
+    plugin_catalog_cache_refreshed: bool,
+    plugin_catalog_cache_refresh_error: Option<String>,
+}
+
+async fn inject_until_ready(
+    client: &reqwest::Client,
+    port: u16,
+    initial_target: CdpTarget,
+    expected_models: &[String],
+    source: &str,
+) -> Result<(CdpTarget, InjectedStatus)> {
+    let deadline = tokio::time::Instant::now() + ENHANCED_INJECTION_TIMEOUT;
+    let mut initial_target = Some(initial_target);
+    let mut active: Option<ActiveInjection> = None;
+    let mut last_error = None::<String>;
+    let mut last_status_detail = None::<String>;
+    loop {
+        let target = match initial_target.take() {
+            Some(target) => Some(target),
+            None => match find_app_target(client, port).await {
+                Ok(target) => target,
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    None
+                }
+            },
+        };
+        if let Some(target) = target {
+            let replace_session = active
+                .as_ref()
+                .map(|current| !same_cdp_target(&current.target, &target))
+                .unwrap_or(true);
+            if replace_session {
+                if let Some(current) = active.as_ref() {
+                    chain_log::write_line(format!(
+                        "[codex_app_enhanced] event=target_changed old_target_id={} new_target_id={}",
+                        current.target.id, target.id
+                    ));
+                }
+                active = None;
+                match connect_and_install(&target, port, source).await {
+                    Ok(connection) => active = Some(connection),
+                    Err(err) => last_error = Some(err.to_string()),
+                }
+            }
+
+            if let Some(connection) = active.as_mut() {
+                match inspect_injected_status_on_socket(connection).await {
+                    Ok(status) => {
+                        let ready = injected_status_is_ready(&status, expected_models);
+                        let should_reapply =
+                            should_reapply_script(&status, connection.installed_at.elapsed());
+                        last_status_detail = Some(injected_status_detail(&status));
+                        if ready {
+                            let connection = active
+                                .take()
+                                .expect("active injection exists after status check");
+                            retain_page_cdp_session(connection.socket);
+                            return Ok((connection.target, status));
+                        }
+                        if should_reapply {
+                            if let Err(err) = reapply_script(connection, source).await {
+                                last_error = Some(err.to_string());
+                                active = None;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        last_error = Some(err.to_string());
+                        active = None;
+                    }
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let mut details = Vec::new();
+            if let Some(status) = last_status_detail.as_deref() {
+                details.push(format!("兼容状态：{status}"));
+            }
+            if let Some(error) = last_error.as_deref() {
+                details.push(format!("CDP：{error}"));
+            }
+            let detail = (!details.is_empty())
+                .then(|| format!("（{}）", details.join("；")))
+                .unwrap_or_default();
+            bail!("Codex App 已启动，但增强配置（模型列表/语言）未在 45 秒内生效{detail}");
+        }
+        tokio::time::sleep(ENHANCED_STATUS_POLL_INTERVAL).await;
+    }
+}
+
+fn should_reapply_script(status: &InjectedStatus, installed_for: Duration) -> bool {
+    (!status.script_installed && installed_for >= Duration::from_secs(2))
+        || installed_for >= ENHANCED_SCRIPT_RETRY_INTERVAL
+}
+
+fn injected_status_is_ready(status: &InjectedStatus, expected_models: &[String]) -> bool {
+    // Renderer routes may mount well after Statsig is updated; the retained script
+    // will keep the enhanced configuration active while the UI finishes loading.
+    status.script_installed
+        && status.script_applied
+        && status.script_version == Some(ENHANCED_SCRIPT_VERSION)
+        && status.ready
+        && status.available_models == expected_models
+        && !status.use_hidden_models
+        && status.key_gates_enabled == SUPPORTED_FEATURE_GATES.len()
+        && status.i18n_enabled
+        && status.local_initialize_installed
+        && (status.official_base_available || status.local_base_available)
+        && status.model_config_supported
+        && status.i18n_layer_supported
+        && status.plugin_catalog_bridge_installed
+        && status.plugin_catalog_dispatch_patched
+        && !status.compatibility_adapters.is_empty()
+}
+
+fn injected_status_detail(status: &InjectedStatus) -> String {
+    format!(
+        "script={} attempts={} store={} official_base={} local_base={} local_initialize={}:{} local_initialize_error={} model={}:{} i18n={}:{} gates={}/{} plugin_bridge={} plugin_dispatch={} plugin_responses={} plugin_cache={}:{} plugin_cache_error={} adapters={} failure={}",
+        status
+            .script_version
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        status.script_attempts,
+        status.store_source.as_deref().unwrap_or("none"),
+        status.official_base_available,
+        status.local_base_available,
+        status.local_initialize_installed,
+        status.local_initialize_active,
+        status.local_initialize_error.as_deref().unwrap_or("none"),
+        status.model_config_id.as_deref().unwrap_or("none"),
+        status.model_config_supported,
+        status.i18n_layer_id.as_deref().unwrap_or("none"),
+        status.i18n_layer_supported,
+        status.key_gates_enabled,
+        SUPPORTED_FEATURE_GATES.len(),
+        status.plugin_catalog_bridge_installed,
+        status.plugin_catalog_dispatch_patched,
+        status.plugin_catalog_responses_adapted,
+        status.plugin_catalog_cache_refresh_attempted,
+        status.plugin_catalog_cache_refreshed,
+        status
+            .plugin_catalog_cache_refresh_error
+            .as_deref()
+            .unwrap_or("none"),
+        status.compatibility_adapters.join(","),
+        status.compatibility_failure.as_deref().unwrap_or("none")
+    )
+}
+
+async fn inspect_injected_status_on_socket(active: &mut ActiveInjection) -> Result<InjectedStatus> {
+    let gates = serde_json::to_string(SUPPORTED_FEATURE_GATES)?;
+    let expression = format!(
+        r#"(() => {{
+           const enhanced = window.__CHATROUTE_ENHANCED_MODE__;
+           const root = window.__STATSIG__;
+           let instance = null;
+           try {{ instance = typeof root?.instance === "function" ? root.instance() : null; }} catch {{}}
+           const client = enhanced?.client
+             ?? root?.firstInstance
+             ?? instance
+             ?? Object.values(root?.instances ?? {{}})[0];
+           const modelConfigId = enhanced?.modelConfigId ?? "107580212";
+           const i18nLayerId = enhanced?.i18nLayerId ?? "72216192";
+           const config = client?.getDynamicConfig?.(modelConfigId)?.value;
+           const i18n = client?.getLayer?.(i18nLayerId);
+           const gates = {gates};
+           return {{
+             scriptInstalled: Boolean(enhanced?.installed),
+             scriptApplied: Boolean(enhanced?.applied),
+             scriptVersion: enhanced?.version ?? null,
+             ready: Boolean(Array.isArray(config?.available_models)),
+            availableModels: config?.available_models ?? [],
+            useHiddenModels: config?.use_hidden_models ?? true,
+            keyGatesEnabled: gates.filter((gate) => client?.checkGate?.(gate) === true).length,
+            i18nEnabled: i18n?.get?.("enable_i18n", false) === true,
+            fastInitializeApplied: Boolean(window.__CHATROUTE_ENHANCED_MODE__?.fastInitializeApplied),
+            fastInitializeSource: window.__CHATROUTE_ENHANCED_MODE__?.fastInitializeSource ?? null,
+            localInitializeInstalled: Boolean(enhanced?.localInitializeInstalled),
+            localInitializeActive: Boolean(enhanced?.localInitializeActive),
+            localInitializeUrl: enhanced?.localInitializeUrl ?? null,
+            localInitializeError: enhanced?.localInitializeError ?? null,
+            localBaseAvailable: Boolean(enhanced?.localBaseAvailable),
+            bootstrapIntercepted: Boolean(window.__CHATROUTE_ENHANCED_MODE__?.bootstrapIntercepted),
+            bootstrapSource: window.__CHATROUTE_ENHANCED_MODE__?.bootstrapSource ?? null,
+            modelConfigId: enhanced?.modelConfigId ?? null,
+            modelConfigSource: enhanced?.modelConfigSource ?? null,
+            modelConfigSupported: Boolean(enhanced?.modelConfigSupported),
+            i18nLayerId: enhanced?.i18nLayerId ?? null,
+            i18nLayerSource: enhanced?.i18nLayerSource ?? null,
+            i18nLayerSupported: Boolean(enhanced?.i18nLayerSupported),
+            officialBaseAvailable: Boolean(enhanced?.officialBaseAvailable),
+            compatibilityAdapters: enhanced?.compatibilityAdapters ?? [],
+            compatibilityFailure: enhanced?.compatibilityFailure ?? null,
+            storeSource: client?._store?.getSource?.() ?? null,
+            scriptAttempts: Number(enhanced?.attempts ?? 0),
+            routesMounted: Boolean(window.__CHATROUTE_ENHANCED_MODE__?.routesMounted),
+            rendererReadyMs: window.__CHATROUTE_ENHANCED_MODE__?.routesMountedAtMs ?? null,
+            pluginCatalogBridgeInstalled: Boolean(
+              window.__CHATROUTE_ENHANCED_MODE__?.pluginCatalogBridgeInstalled
+            ),
+            pluginCatalogDispatchPatched: Boolean(
+              window.__CHATROUTE_ENHANCED_MODE__?.pluginCatalogDispatchPatched
+            ),
+            pluginCatalogResponsesAdapted: Number(
+              window.__CHATROUTE_ENHANCED_MODE__?.pluginCatalogResponsesAdapted ?? 0
+            ),
+            pluginCatalogCacheRefreshAttempted: Boolean(
+              window.__CHATROUTE_ENHANCED_MODE__?.pluginCatalogCacheRefreshAttempted
+            ),
+            pluginCatalogCacheRefreshed: Boolean(
+              window.__CHATROUTE_ENHANCED_MODE__?.pluginCatalogCacheRefreshed
+            ),
+            pluginCatalogCacheRefreshError:
+              window.__CHATROUTE_ENHANCED_MODE__?.pluginCatalogCacheRefreshError ?? null,
+          }};
+        }})()"#
+    );
+    let result = cdp_command(
+        &mut active.socket,
+        &mut active.command_id,
+        "Runtime.evaluate",
+        json!({ "expression": expression, "returnByValue": true }),
+    )
+    .await?;
+    let value = result
+        .pointer("/result/value")
+        .cloned()
+        .context("Codex CDP 状态响应缺少 value")?;
+    Ok(serde_json::from_value(value)?)
+}
+
+fn enhanced_statsig_script(models: &[String], backend_url: &str) -> Result<String> {
+    let models = serde_json::to_string(models)?;
+    let gates = serde_json::to_string(SUPPORTED_FEATURE_GATES)?;
+    let legacy_gates = serde_json::to_string(LEGACY_CHATROUTE_FEATURE_GATES)?;
+    let mut local_initialize_url =
+        Url::parse(backend_url).context("解析 ChatRoute 本地后端地址失败")?;
+    local_initialize_url.set_path("/codex-app/statsig/v1/initialize");
+    local_initialize_url.set_query(None);
+    local_initialize_url.set_fragment(None);
+    let local_initialize_url = serde_json::to_string(local_initialize_url.as_str())?;
+    let script_version = ENHANCED_SCRIPT_VERSION;
+    Ok(format!(
+        r#"(() => {{
+  const MARKER = "__CHATROUTE_ENHANCED_MODE__";
+  const SCRIPT_VERSION = {script_version};
+  const MODELS = {models};
+  const SUPPORTED_GATES = {gates};
+  const LEGACY_CHATROUTE_GATES = {legacy_gates};
+  const LOCAL_STATSIG_INITIALIZE_URL = {local_initialize_url};
+  const existing = window[MARKER];
+  if (existing?.installed && existing.version === SCRIPT_VERSION) {{
+      existing.update?.(MODELS);
+      existing.installPluginCatalogDispatchPatch?.();
+      existing.refreshPluginCatalogCache?.();
+      return;
+  }}
+  if (existing?.installed) existing.applying = true;
+  const DEFAULT_MODEL_CONFIG_ID = "107580212";
+  const DEFAULT_I18N_LAYER_ID = "72216192";
+  const LOCAL_CURATED_MARKETPLACE = "openai-curated";
+  const LOCAL_CURATED_RENDERER_ALIAS = "codex-official";
+  const state = {{
+    installed: true,
+    version: SCRIPT_VERSION,
+    applied: false,
+    attempts: 0,
+    client: null,
+    models: MODELS,
+    bootstrapIntercepted: false,
+    bootstrapInterceptedAtMs: null,
+    bootstrapSource: null,
+    fastInitializeApplied: false,
+    fastInitializeAppliedAtMs: null,
+    fastInitializeSource: null,
+    fastInitializeError: null,
+    localInitializeInstalled: false,
+    localInitializeActive: false,
+    localInitializeUrl: null,
+    localInitializeError: null,
+    localBaseAvailable: false,
+    modelConfigId: DEFAULT_MODEL_CONFIG_ID,
+    modelConfigSource: "fallback",
+    modelConfigSupported: false,
+    i18nLayerId: DEFAULT_I18N_LAYER_ID,
+    i18nLayerSource: "fallback",
+    i18nLayerSupported: false,
+    officialBaseAvailable: false,
+    officialBaseCheckedAtMs: 0,
+    compatibilityAdapters: [],
+    compatibilityFailure: null,
+    i18nReactCacheInvalidated: 0,
+    routesMounted: false,
+    routesMountedAtMs: null,
+    pluginCatalogBridgeInstalled: false,
+    pluginCatalogDispatchPatched: false,
+    pluginCatalogResponsesAdapted: 0,
+    pluginCatalogRequestIds: new Set(),
+    pluginCatalogError: null,
+    pluginCatalogCacheRefreshAttempts: 0,
+    pluginCatalogCacheRefreshAttempted: false,
+    pluginCatalogCacheRefreshInFlight: false,
+    pluginCatalogCacheRefreshed: false,
+    pluginCatalogCacheRefreshError: null,
+    pluginDirectoryLinkInstalled: false,
+    pluginDirectoryLinkError: null,
+  }};
+  window[MARKER] = state;
+
+  const isObject = (value) => value !== null
+    && typeof value === "object"
+    && !Array.isArray(value);
+  const isChatRouteLocalEntry = (entry) => isObject(entry)
+    && (entry.rule_id === "chatroute-local" || entry.r === "chatroute-local");
+  const statsigEntryValue = (values, entry) => {{
+    if (!isObject(entry)) return null;
+    if (isObject(entry.value)) return entry.value;
+    if (typeof entry.v === "string" && isObject(values.values?.[entry.v])) {{
+      return values.values[entry.v];
+    }}
+    return null;
+  }};
+  const isModelConfigValue = (value) => isObject(value)
+    && Array.isArray(value.available_models)
+    && (Object.prototype.hasOwnProperty.call(value, "use_hidden_models")
+      || Object.prototype.hasOwnProperty.call(value, "default_model"));
+  const isI18nLayerValue = (value) => isObject(value)
+    && (Object.prototype.hasOwnProperty.call(value, "enable_i18n")
+      || Object.prototype.hasOwnProperty.call(value, "locale_source"));
+  const discoverConfigIds = (values) => {{
+    if (!isObject(values)) return;
+    const modelEntries = Object.entries(values.dynamic_configs ?? {{}})
+      .filter(([, entry]) => isModelConfigValue(statsigEntryValue(values, entry)));
+    const modelMatch = modelEntries.find(([, entry]) => !isChatRouteLocalEntry(entry))
+      ?? modelEntries[0];
+    if (modelMatch) {{
+      state.modelConfigId = modelMatch[0];
+      state.modelConfigSource = "schema";
+      state.modelConfigSupported = true;
+    }} else if (values.dynamic_configs?.[DEFAULT_MODEL_CONFIG_ID]) {{
+      state.modelConfigId = DEFAULT_MODEL_CONFIG_ID;
+      state.modelConfigSource = "fallback-present";
+      state.modelConfigSupported = true;
+    }}
+    const i18nEntries = Object.entries(values.layer_configs ?? {{}})
+      .filter(([, entry]) => isI18nLayerValue(statsigEntryValue(values, entry)));
+    const i18nMatch = i18nEntries.find(([, entry]) => !isChatRouteLocalEntry(entry))
+      ?? i18nEntries[0];
+    if (i18nMatch) {{
+      state.i18nLayerId = i18nMatch[0];
+      state.i18nLayerSource = "schema";
+      state.i18nLayerSupported = true;
+    }} else if (values.layer_configs?.[DEFAULT_I18N_LAYER_ID]) {{
+      state.i18nLayerId = DEFAULT_I18N_LAYER_ID;
+      state.i18nLayerSource = "fallback-present";
+      state.i18nLayerSupported = true;
+    }}
+  }};
+  const compatibilityReady = () => (state.officialBaseAvailable || state.localBaseAvailable)
+    && state.modelConfigSupported
+    && state.i18nLayerSupported;
+  const recordAdapter = (name) => {{
+    if (!state.compatibilityAdapters.includes(name)) state.compatibilityAdapters.push(name);
+  }};
+
+  const patchValues = (values) => {{
+    if (!values || typeof values !== "object") values = {{}};
+    values.feature_gates ??= {{}};
+    values.dynamic_configs ??= {{}};
+    values.layer_configs ??= {{}};
+    values.values ??= {{}};
+    discoverConfigIds(values);
+    if (!state.modelConfigSupported || !state.i18nLayerSupported) {{
+      const missing = [];
+      if (!state.modelConfigSupported) missing.push("model-config");
+      if (!state.i18nLayerSupported) missing.push("i18n-layer");
+      state.compatibilityFailure = `unsupported Statsig schema: ${{missing.join(",")}}`;
+      return values;
+    }}
+    state.compatibilityFailure = null;
+    values.has_updates = true;
+    values.time = Math.max(Number(values.time ?? 0), Date.now());
+    values.param_stores ??= {{}};
+    values.sdkParams ??= {{}};
+    values.sdk_flags ??= {{}};
+    const modelConfigId = state.modelConfigId;
+    const i18nLayerId = state.i18nLayerId;
+    const currentI18nLayer = values.layer_configs[i18nLayerId];
+    const currentI18nValue = currentI18nLayer?.value && typeof currentI18nLayer.value === "object"
+      ? currentI18nLayer.value
+      : currentI18nLayer?.v && values.values[currentI18nLayer.v]
+        && typeof values.values[currentI18nLayer.v] === "object"
+        ? values.values[currentI18nLayer.v]
+        : values.values.chatroute_i18n_layer_config
+        && typeof values.values.chatroute_i18n_layer_config === "object"
+        ? values.values.chatroute_i18n_layer_config
+        : {{}};
+    const modelEntry = values.dynamic_configs[modelConfigId];
+    const modelIsV2 = typeof modelEntry?.v === "string"
+      && Object.prototype.hasOwnProperty.call(values.values, modelEntry.v)
+      && !modelEntry?.value;
+    const i18nIsV2 = typeof currentI18nLayer?.v === "string"
+      && Object.prototype.hasOwnProperty.call(values.values, currentI18nLayer.v)
+      && !currentI18nLayer?.value;
+    const allEntries = [
+      ...Object.values(values.feature_gates),
+      ...Object.values(values.dynamic_configs),
+      ...Object.values(values.layer_configs),
+    ];
+    const hasV1Entries = allEntries.some((entry) => entry
+      && typeof entry === "object"
+      && Object.prototype.hasOwnProperty.call(entry, "value"));
+    const isV2 = !hasV1Entries && (values.response_format === "init-v2"
+      || modelIsV2 && i18nIsV2);
+    if (isV2) values.response_format = "init-v2";
+    else if (values.response_format === "init-v2") delete values.response_format;
+    for (const gate of LEGACY_CHATROUTE_GATES) {{
+      const current = values.feature_gates[gate];
+      if (current?.rule_id === "chatroute-local" || current?.r === "chatroute-local") {{
+        delete values.feature_gates[gate];
+      }}
+    }}
+    for (const gate of SUPPORTED_GATES) {{
+      const current = values.feature_gates[gate];
+      const next = {{
+        ...(current && typeof current === "object" ? current : {{}}),
+        name: gate,
+        rule_id: "chatroute-local",
+        r: "chatroute-local",
+        secondary_exposures: current?.secondary_exposures ?? current?.s ?? [],
+        s: current?.s ?? current?.secondary_exposures ?? [],
+        version: current?.version ?? 1,
+        id_type: current?.id_type ?? current?.i ?? "userID",
+        i: current?.i ?? current?.id_type ?? "userID",
+        value: true,
+        v: true,
+      }};
+      if (isV2) delete next.value;
+      else delete next.v;
+      values.feature_gates[gate] = next;
+    }}
+    const current = values.dynamic_configs[modelConfigId];
+    const modelValue = {{
+      ...(current?.value && typeof current.value === "object" ? current.value : {{}}),
+      ...(current?.v && values.values[current.v] && typeof values.values[current.v] === "object"
+        ? values.values[current.v]
+        : {{}}),
+      available_models: state.models,
+      default_model: state.models[0] ?? "gpt-5.6-sol",
+      use_hidden_models: false,
+    }};
+    const nextConfig = {{
+      ...(current && typeof current === "object" ? current : {{}}),
+      name: modelConfigId,
+      rule_id: "chatroute-local",
+      r: "chatroute-local",
+      secondary_exposures: current?.secondary_exposures ?? [],
+      s: current?.s ?? current?.secondary_exposures ?? [],
+      version: current?.version ?? 1,
+      id_type: current?.id_type ?? current?.i ?? "userID",
+      i: current?.i ?? current?.id_type ?? "userID",
+      is_device_based: current?.is_device_based ?? false,
+      passed: true,
+    }};
+    if (isV2) {{
+      const modelKey = typeof current?.v === "string" ? current.v : "chatroute_model_list_config";
+      nextConfig.v = modelKey;
+      delete nextConfig.value;
+      values.values[modelKey] = modelValue;
+    }} else {{
+      nextConfig.value = modelValue;
+      delete nextConfig.v;
+    }}
+    values.dynamic_configs[modelConfigId] = nextConfig;
+    const i18nValue = {{
+      ...currentI18nValue,
+      enable_i18n: true,
+      locale_source: currentI18nValue.locale_source ?? "FIRST_AVAILABLE",
+    }};
+    const nextI18nLayer = {{
+      ...(currentI18nLayer && typeof currentI18nLayer === "object" ? currentI18nLayer : {{}}),
+      name: i18nLayerId,
+      rule_id: "chatroute-local",
+      r: "chatroute-local",
+      secondary_exposures: currentI18nLayer?.secondary_exposures ?? currentI18nLayer?.s ?? [],
+      s: currentI18nLayer?.s ?? currentI18nLayer?.secondary_exposures ?? [],
+      id_type: currentI18nLayer?.id_type ?? currentI18nLayer?.i ?? "userID",
+      i: currentI18nLayer?.i ?? currentI18nLayer?.id_type ?? "userID",
+      passed: true,
+    }};
+    if (isV2) {{
+      const layerKey = typeof currentI18nLayer?.v === "string"
+        ? currentI18nLayer.v
+        : "chatroute_i18n_layer_config";
+      nextI18nLayer.v = layerKey;
+      delete nextI18nLayer.value;
+      values.values[layerKey] = i18nValue;
+    }} else {{
+      nextI18nLayer.value = i18nValue;
+      delete nextI18nLayer.v;
+    }}
+    values.layer_configs[i18nLayerId] = nextI18nLayer;
+    return values;
+  }};
+  // A local compatibility payload is not a substitute for the official evaluation.
+  // Only a structurally complete evaluation with at least one official entry may be
+  // used as the fast-start base.
+  const isCompleteOfficialValues = (values) => {{
+    if (!isObject(values)
+      || !isObject(values.feature_gates)
+      || !isObject(values.dynamic_configs)
+      || !isObject(values.layer_configs)) return false;
+    const entries = [
+      ...Object.values(values.feature_gates),
+      ...Object.values(values.dynamic_configs),
+      ...Object.values(values.layer_configs),
+    ];
+    const hasOfficialEntry = entries.some((entry) => isObject(entry)
+      && !isChatRouteLocalEntry(entry));
+    if (!hasOfficialEntry) return false;
+    const valueCount = isObject(values.values) ? Object.keys(values.values).length : 0;
+    const sectionCount = Object.keys(values.feature_gates).length
+      + Object.keys(values.dynamic_configs).length
+      + Object.keys(values.layer_configs).length;
+    const runtimeValue = statsigEntryValue(values, values.layer_configs["2096615506"]);
+    const hasRuntimeConfig = isObject(runtimeValue) && Object.keys(runtimeValue).length > 0;
+    const hasEvaluationMetadata = isObject(values.evaluated_keys)
+      || isObject(values.sdkParams)
+      || isObject(values.sdk_flags);
+    return hasRuntimeConfig || hasEvaluationMetadata || valueCount > 0 || sectionCount >= 4;
+  }};
+
+  const isCompleteChatRouteValues = (values) => {{
+    if (!isObject(values)
+      || !isObject(values.feature_gates)
+      || !isObject(values.dynamic_configs)
+      || !isObject(values.layer_configs)) return false;
+    const modelEntry = values.dynamic_configs[DEFAULT_MODEL_CONFIG_ID];
+    const i18nEntry = values.layer_configs[DEFAULT_I18N_LAYER_ID];
+    return isChatRouteLocalEntry(modelEntry)
+      && isModelConfigValue(statsigEntryValue(values, modelEntry))
+      && isChatRouteLocalEntry(i18nEntry)
+      && isI18nLayerValue(statsigEntryValue(values, i18nEntry));
+  }};
+
+  const isUsableBaseValues = (values) => isCompleteOfficialValues(values)
+    || isCompleteChatRouteValues(values);
+
+  const markBaseAvailability = (values) => {{
+    if (isCompleteOfficialValues(values)) state.officialBaseAvailable = true;
+    if (isCompleteChatRouteValues(values)) state.localBaseAvailable = true;
+  }};
+
+  const STORE_PATCH_MARKER = "__CHATROUTE_ENHANCED_SET_VALUES_PATCH__";
+  const installStorePatch = (client) => {{
+    const store = client?._store;
+    if (!store || typeof store.setValues !== "function") return false;
+    const installed = store[STORE_PATCH_MARKER];
+    if (installed) {{
+      installed.patch = patchValues;
+      recordAdapter("statsig-store");
+      return true;
+    }}
+    const control = {{
+      original: store.setValues.bind(store),
+      patch: patchValues,
+    }};
+    store.setValues = (packet, user) => {{
+      if (!packet || typeof packet.data !== "string") return control.original(packet, user);
+      try {{
+        const values = JSON.parse(packet.data);
+        if (isUsableBaseValues(values)) {{
+          markBaseAvailability(values);
+          discoverConfigIds(values);
+          packet = {{ ...packet, data: JSON.stringify(control.patch(values)) }};
+        }}
+      }} catch {{}}
+      return control.original(packet, user);
+    }};
+    store[STORE_PATCH_MARKER] = control;
+    recordAdapter("statsig-store");
+    return true;
+  }};
+
+  const originalInitializeUrls = new WeakMap();
+  const installLocalInitializePatch = (client) => {{
+    const urlConfig = client?._network?._initializeUrlConfig;
+    if (!urlConfig || typeof urlConfig !== "object") {{
+      state.localInitializeInstalled = false;
+      state.localInitializeError = "Statsig initialize URL config is unavailable";
+      return false;
+    }}
+    try {{
+      if (!originalInitializeUrls.has(urlConfig)) {{
+        originalInitializeUrls.set(urlConfig, urlConfig.customUrl ?? null);
+      }}
+      urlConfig.customUrl = LOCAL_STATSIG_INITIALIZE_URL;
+      if (urlConfig.customUrl !== LOCAL_STATSIG_INITIALIZE_URL) {{
+        throw new Error("Statsig initialize URL config rejected the local URL");
+      }}
+      state.localInitializeInstalled = true;
+      state.localInitializeActive = true;
+      state.localInitializeUrl = LOCAL_STATSIG_INITIALIZE_URL;
+      state.localInitializeError = null;
+      recordAdapter("local-statsig-initialize");
+      return true;
+    }} catch (error) {{
+      state.localInitializeInstalled = false;
+      state.localInitializeActive = false;
+      state.localInitializeError = String(error?.stack ?? error);
+      return false;
+    }}
+  }};
+
+  const restoreOfficialInitializeUrl = (client) => {{
+    const urlConfig = client?._network?._initializeUrlConfig;
+    if (!urlConfig || !originalInitializeUrls.has(urlConfig)) return false;
+    try {{
+      urlConfig.customUrl = originalInitializeUrls.get(urlConfig);
+      state.localInitializeActive = false;
+      state.localInitializeError = null;
+      recordAdapter("official-statsig-refresh");
+      return true;
+    }} catch (error) {{
+      state.localInitializeError = String(error?.stack ?? error);
+      return false;
+    }}
+  }};
+
+  const FAST_INITIALIZE_PATCH_MARKER = "__CHATROUTE_ENHANCED_FAST_INITIALIZE_PATCH__";
+  const installFastInitializePatch = (client) => {{
+    if (!client
+      || typeof client.initializeAsync !== "function"
+      || typeof client.initializeSync !== "function"
+      || typeof client.dataAdapter?.setData !== "function") return false;
+    if (client[FAST_INITIALIZE_PATCH_MARKER]) {{
+      recordAdapter("fast-initialize");
+      return true;
+    }}
+    const control = {{
+      original: client.initializeAsync.bind(client),
+      promise: null,
+    }};
+    client.initializeAsync = (options) => {{
+      if (control.promise) return control.promise;
+      try {{
+        const bootstrapPayload = buildBootstrapPayload();
+        if (!bootstrapPayload) {{
+          state.fastInitializeSource = state.localInitializeInstalled
+            ? "local-network"
+            : "official-network";
+          state.bootstrapSource = state.fastInitializeSource;
+          try {{
+            const details = control.original(options);
+            control.promise = Promise.resolve(details).then((result) => {{
+              try {{ applyClient(client); }} catch (error) {{
+                state.fastInitializeError = String(error?.stack ?? error);
+              }}
+              return result;
+            }});
+          }} catch (error) {{
+            state.fastInitializeError = String(error?.stack ?? error);
+            control.promise = Promise.reject(error);
+          }}
+          return control.promise;
+        }}
+        const values = JSON.parse(bootstrapPayload);
+        const currentUser = client.getContext?.().user ?? client._user;
+        if (currentUser && typeof currentUser === "object") {{
+          values.user = structuredClone(currentUser);
+        }}
+        client.dataAdapter.setData(JSON.stringify(values));
+        const details = client.initializeSync({{ disableBackgroundCacheRefresh: true }});
+        if (client.loadingStatus !== "Ready") {{
+          throw new Error(`local Statsig initialization ended in ${{client.loadingStatus}}`);
+        }}
+        state.fastInitializeApplied = true;
+        state.fastInitializeAppliedAtMs = Math.round(performance.now());
+        state.fastInitializeSource = state.bootstrapSource ?? "statsig-cache-official";
+        restoreOfficialInitializeUrl(client);
+        control.promise = Promise.resolve(details);
+      }} catch (error) {{
+        state.fastInitializeError = String(error?.stack ?? error);
+        control.promise = control.original(options);
+      }}
+      return control.promise;
+    }};
+    client[FAST_INITIALIZE_PATCH_MARKER] = control;
+    recordAdapter("fast-initialize");
+    return true;
+  }};
+
+  const installClientPatches = (client) => {{
+    installLocalInitializePatch(client);
+    installPublicApiOverlay(client);
+    installStorePatch(client);
+    installFastInitializePatch(client);
+  }};
+
+  const clientsForStatsigRoot = (statsig) => {{
+    if (!statsig || typeof statsig !== "object") return [];
+    let instance = null;
+    try {{ instance = typeof statsig.instance === "function" ? statsig.instance() : null; }} catch {{}}
+    const clients = [
+      statsig.firstInstance,
+      instance,
+      ...Object.values(statsig.instances ?? {{}}),
+    ];
+    return clients.filter((client, index, all) => client
+      && typeof client === "object"
+      && (typeof client.getDynamicConfig === "function"
+        || typeof client.getLayer === "function"
+        || typeof client.checkGate === "function")
+      && all.indexOf(client) === index);
+  }};
+
+  const findStatsigClients = () => {{
+    const roots = [];
+    const addRoot = (root) => {{
+      if (root && typeof root === "object" && !roots.includes(root)) roots.push(root);
+    }};
+    addRoot(window.__STATSIG__);
+    for (const name of Object.getOwnPropertyNames(window)) {{
+      if (!name.toLowerCase().includes("statsig")) continue;
+      try {{ addRoot(window[name]); }} catch {{}}
+    }}
+    return roots.flatMap(clientsForStatsigRoot)
+      .filter((client, index, all) => all.indexOf(client) === index);
+  }};
+
+  const installStatsigClientPatches = (statsig) => {{
+    for (const client of clientsForStatsigRoot(statsig)) installClientPatches(client);
+  }};
+
+  const hookFirstInstance = (statsig) => {{
+    if (!statsig || typeof statsig !== "object") return;
+    const marker = "__CHATROUTE_ENHANCED_FIRST_INSTANCE_HOOK__";
+    if (statsig[marker]) {{
+      installStatsigClientPatches(statsig);
+      return;
+    }}
+    const descriptor = Object.getOwnPropertyDescriptor(statsig, "firstInstance");
+    if (descriptor?.configurable === false) {{
+      installStatsigClientPatches(statsig);
+      return;
+    }}
+    let current = statsig.firstInstance;
+    Object.defineProperty(statsig, "firstInstance", {{
+      configurable: true,
+      enumerable: true,
+      get: () => current,
+      set: (client) => {{
+        current = client;
+        installClientPatches(client);
+      }},
+    }});
+    statsig[marker] = true;
+    installStatsigClientPatches(statsig);
+  }};
+
+  const hookStatsigGlobal = () => {{
+    const marker = "__CHATROUTE_ENHANCED_GLOBAL_HOOK__";
+    const descriptor = Object.getOwnPropertyDescriptor(window, "__STATSIG__");
+    if (descriptor?.get?.[marker]) {{
+      hookFirstInstance(window.__STATSIG__);
+      return;
+    }}
+    if (descriptor?.configurable === false) {{
+      hookFirstInstance(window.__STATSIG__);
+      return;
+    }}
+    let current = window.__STATSIG__;
+    const getStatsig = () => current;
+    getStatsig[marker] = true;
+    Object.defineProperty(window, "__STATSIG__", {{
+      configurable: true,
+      enumerable: descriptor?.enumerable ?? true,
+      get: getStatsig,
+      set: (statsig) => {{
+        current = statsig;
+        hookFirstInstance(statsig);
+      }},
+    }});
+    hookFirstInstance(current);
+  }};
+
+  const patchSerialized = (raw) => {{
+    if (typeof raw !== "string") return raw;
+    try {{
+      const parsed = JSON.parse(raw);
+      const visit = (value, depth = 0) => {{
+        if (depth > 10 || value == null) return value;
+        if (typeof value === "string") {{
+          const trimmed = value.trim();
+          if (!trimmed.startsWith("{{") && !trimmed.startsWith("[")) return value;
+          try {{ return JSON.stringify(visit(JSON.parse(value), depth + 1)); }} catch {{ return value; }}
+        }}
+        if (Array.isArray(value)) return value.map((item) => visit(item, depth + 1));
+        if (typeof value !== "object") return value;
+        if (isCompleteOfficialValues(value)) {{
+          patchValues(value);
+        }}
+        for (const key of Object.keys(value)) value[key] = visit(value[key], depth + 1);
+        return value;
+      }};
+      return JSON.stringify(visit(parsed));
+    }} catch {{ return raw; }}
+  }};
+
+  const originalGetItem = Storage.prototype.getItem;
+
+  const localUser = (values, envelope) => {{
+    const evaluatedCustomIDs = values?.evaluated_keys?.customIDs;
+    const stableIDKey = Object.keys(localStorage)
+      .find((key) => key.startsWith("statsig.stable_id."));
+    const stableID = envelope?.stableID
+      ?? evaluatedCustomIDs?.stableID
+      ?? (stableIDKey ? originalGetItem.call(localStorage, stableIDKey) : undefined)
+      ?? undefined;
+    return {{
+      userID: "user_chatroute_local",
+      email: "chatroute-local@example.local",
+      locale: navigator.language || "en",
+      customIDs: {{
+        ...(evaluatedCustomIDs && typeof evaluatedCustomIDs === "object" ? evaluatedCustomIDs : {{}}),
+        ...(stableID ? {{ stableID, source_surface_stable_id: stableID }} : {{}}),
+        account_id: "acct_chatroute_local",
+      }},
+      custom: {{
+        auth_status: "logged_in",
+        auth_method: "chatgpt",
+        account_id: "acct_chatroute_local",
+        plan_type: "pro",
+        brand_name: "codex",
+      }},
+    }};
+  }};
+
+  const selectOfficialBootstrap = () => {{
+    let selected = null;
+    for (const key of Object.keys(localStorage)) {{
+      if (!key.startsWith("statsig.cached.evaluations.")) continue;
+      try {{
+        const envelope = JSON.parse(originalGetItem.call(localStorage, key));
+        const values = JSON.parse(envelope?.data);
+        if (!isCompleteOfficialValues(values)) continue;
+        const receivedAt = Number(envelope.receivedAt ?? values.time ?? 0);
+        const evaluatedUserID = values?.evaluated_keys?.userID;
+        const priority = evaluatedUserID == null
+          ? 2
+          : evaluatedUserID === "user_chatroute_local" ? 1 : 0;
+        if (!selected
+          || priority > selected.priority
+          || (priority === selected.priority && receivedAt > selected.receivedAt)) {{
+          selected = {{ envelope, values, receivedAt, priority }};
+        }}
+      }} catch {{}}
+    }}
+    return selected;
+  }};
+
+  const cachedBootstrapSource = (selected, late) => {{
+    if (selected.priority === 2) {{
+      return late ? "statsig-cache-late-prelogin" : "statsig-cache-prelogin";
+    }}
+    if (selected.priority === 1) {{
+      return late ? "statsig-cache-late-local" : "statsig-cache-local";
+    }}
+    return late ? "statsig-cache-late-other" : "statsig-cache-other";
+  }};
+
+  const buildBootstrapPayload = () => {{
+    const selected = selectOfficialBootstrap();
+    if (!selected) {{
+      state.bootstrapSource = "official-network";
+      return null;
+    }}
+    state.officialBaseAvailable = true;
+    discoverConfigIds(selected.values);
+    const values = patchValues(structuredClone(selected.values));
+    if (!compatibilityReady()) {{
+      state.bootstrapSource = "statsig-cache-unsupported";
+      return null;
+    }}
+    values.user = localUser(values, selected?.envelope);
+    state.bootstrapSource = cachedBootstrapSource(selected, false);
+    return JSON.stringify(values);
+  }};
+
+  const recoverOfficialValuesFromCache = (client) => {{
+    const selected = selectOfficialBootstrap();
+    if (!selected) {{
+      state.bootstrapSource ??= "official-network";
+      return null;
+    }}
+    state.officialBaseAvailable = true;
+    discoverConfigIds(selected.values);
+    const values = patchValues(structuredClone(selected.values));
+    if (!compatibilityReady()) return null;
+    const packet = {{
+      data: JSON.stringify(values),
+      source: "Bootstrap",
+      receivedAt: Date.now(),
+    }};
+    if (!client._store.setValues(packet, client._user)) return null;
+    client._finalizeUpdate(packet);
+    state.bootstrapSource = cachedBootstrapSource(selected, true);
+    state.fastInitializeSource ??= state.bootstrapSource;
+    const recovered = client._store.getValues?.();
+    return isCompleteOfficialValues(recovered) ? recovered : values;
+  }};
+
+  const usableBaseForClient = (client) => {{
+    if (state.officialBaseAvailable || state.localBaseAvailable) return true;
+    const stored = client?._store?.getValues?.();
+    if (isUsableBaseValues(stored)) {{
+      markBaseAvailability(stored);
+      discoverConfigIds(stored);
+      return true;
+    }}
+    const now = Date.now();
+    if (now - state.officialBaseCheckedAtMs < 500) return false;
+    state.officialBaseCheckedAtMs = now;
+    const selected = selectOfficialBootstrap();
+    if (!selected) return false;
+    state.officialBaseAvailable = true;
+    discoverConfigIds(selected.values);
+    return true;
+  }};
+
+  const dispatchFetchResponse = (request, body) => {{
+    window.dispatchEvent(new MessageEvent("message", {{
+      source: window,
+      origin: window.location.origin,
+      data: {{
+        type: "fetch-response",
+        requestId: request.requestId,
+        responseType: "success",
+        status: 200,
+        headers: {{}},
+        bodyJsonString: JSON.stringify(body),
+      }},
+    }}));
+  }};
+
+  const adaptLocalCuratedPluginCatalog = (body) => {{
+    if (!body || typeof body !== "object") return 0;
+    const containers = [body, body.data, body.result, body.result?.data];
+    const visited = new Set();
+    let adapted = 0;
+    for (const container of containers) {{
+      if (!container || typeof container !== "object" || visited.has(container)) continue;
+      visited.add(container);
+      if (!Array.isArray(container.marketplaces)) continue;
+      for (const marketplace of container.marketplaces) {{
+        if (!marketplace || typeof marketplace !== "object") continue;
+        if (marketplace.name !== LOCAL_CURATED_MARKETPLACE) continue;
+        if (typeof marketplace.path !== "string" || !marketplace.path.trim()) continue;
+        // The renderer uses the marketplace name only for presentation here. Local
+        // install/read requests continue to use the untouched absolute path.
+        marketplace.name = LOCAL_CURATED_RENDERER_ALIAS;
+        adapted += 1;
+      }}
+    }}
+    if (adapted > 0) {{
+      state.pluginCatalogResponsesAdapted += 1;
+      state.pluginCatalogError = null;
+    }}
+    return adapted;
+  }};
+
+  const trackPluginCatalogRequest = (message) => {{
+    if (message?.type === "mcp-request"
+      && message.request?.method === "plugin/list"
+      && message.request.id != null) {{
+      state.pluginCatalogRequestIds.add(String(message.request.id));
+      return;
+    }}
+    if (message?.type === "fetch"
+      && String(message.method).toUpperCase() === "POST"
+      && message.url === "vscode://codex/list-plugins"
+      && message.requestId != null) {{
+      state.pluginCatalogRequestIds.add(String(message.requestId));
+    }}
+  }};
+
+  const adaptPluginCatalogResponseData = (message) => {{
+    if (message?.type === "mcp-response") {{
+      const response = message.message ?? message.response;
+      const requestId = response?.id == null ? "" : String(response.id);
+      if (requestId) state.pluginCatalogRequestIds.delete(requestId);
+      return adaptLocalCuratedPluginCatalog(response?.result);
+    }}
+    if (message?.type !== "fetch-response"
+      || message.responseType !== "success"
+      || typeof message.bodyJsonString !== "string"
+      || !message.bodyJsonString.trim()) return 0;
+    const requestId = message.requestId == null ? "" : String(message.requestId);
+    if (requestId) state.pluginCatalogRequestIds.delete(requestId);
+    const body = JSON.parse(message.bodyJsonString);
+    const adapted = adaptLocalCuratedPluginCatalog(body);
+    if (adapted > 0) message.bodyJsonString = JSON.stringify(body);
+    return adapted;
+  }};
+
+  const installPluginCatalogDispatchPatch = () => {{
+    const originalKey = "__CHATROUTE_PLUGIN_ORIGINAL_DISPATCH_EVENT__";
+    try {{
+      if (typeof window[originalKey] !== "function") {{
+        window[originalKey] = window.dispatchEvent;
+      }}
+      const originalDispatchEvent = window[originalKey];
+      window.dispatchEvent = function chatRoutePluginDispatchEvent(event) {{
+        try {{
+          if (event?.type === "codex-message-from-view") {{
+            trackPluginCatalogRequest(event.detail);
+          }} else if (event?.type === "message") {{
+            adaptPluginCatalogResponseData(event.data);
+          }}
+        }} catch (error) {{
+          state.pluginCatalogError = String(error?.stack ?? error);
+        }}
+        return originalDispatchEvent.call(this, event);
+      }};
+      window.__CHATROUTE_PLUGIN_DISPATCH_VERSION__ = SCRIPT_VERSION;
+      state.pluginCatalogDispatchPatched = true;
+    }} catch (error) {{
+      state.pluginCatalogDispatchPatched = false;
+      state.pluginCatalogError = String(error?.stack ?? error);
+    }}
+  }};
+
+  const findReactQueryClient = () => {{
+    const elements = [document.body, ...document.querySelectorAll("button,[role='main'],main")];
+    for (const element of elements) {{
+      if (!element) continue;
+      const reactKey = Object.getOwnPropertyNames(element).find((name) =>
+        name.startsWith("__reactFiber$") || name.startsWith("__reactInternalInstance$"));
+      if (!reactKey) continue;
+      let fiber = element[reactKey];
+      for (let level = 0; fiber && level < 200; level += 1, fiber = fiber.return) {{
+        const candidate = fiber.memoizedProps?.client;
+        if (candidate
+          && typeof candidate.invalidateQueries === "function"
+          && typeof candidate.getQueryCache === "function") return candidate;
+      }}
+    }}
+    return null;
+  }};
+
+  const refreshPluginCatalogCache = () => {{
+    if (state.pluginCatalogCacheRefreshed || state.pluginCatalogCacheRefreshInFlight) return;
+    const queryClient = findReactQueryClient();
+    if (!queryClient) {{
+      state.pluginCatalogCacheRefreshAttempts += 1;
+      if (state.pluginCatalogCacheRefreshAttempts < 240) {{
+        setTimeout(refreshPluginCatalogCache,
+          state.pluginCatalogCacheRefreshAttempts < 80 ? 25 : 250);
+      }} else {{
+        state.pluginCatalogCacheRefreshError = "React Query client unavailable";
+      }}
+      return;
+    }}
+    state.pluginCatalogCacheRefreshAttempted = true;
+    state.pluginCatalogCacheRefreshInFlight = true;
+    state.pluginCatalogCacheRefreshError = null;
+    try {{
+      Promise.resolve(queryClient.invalidateQueries({{
+        queryKey: ["plugins"],
+        refetchType: "active",
+      }})).then(() => {{
+        state.pluginCatalogCacheRefreshed = true;
+      }}).catch((error) => {{
+        state.pluginCatalogCacheRefreshError = String(error?.stack ?? error);
+      }}).finally(() => {{
+        state.pluginCatalogCacheRefreshInFlight = false;
+      }});
+    }} catch (error) {{
+      state.pluginCatalogCacheRefreshInFlight = false;
+      state.pluginCatalogCacheRefreshError = String(error?.stack ?? error);
+    }}
+  }};
+
+  installPluginCatalogDispatchPatch();
+  state.installPluginCatalogDispatchPatch = installPluginCatalogDispatchPatch;
+
+  window.addEventListener("message", (event) => {{
+    try {{
+      adaptPluginCatalogResponseData(event?.data);
+    }} catch (error) {{
+      state.pluginCatalogError = String(error?.stack ?? error);
+    }}
+  }}, true);
+
+  window.addEventListener("codex-message-from-view", (event) => {{
+    const message = event?.detail;
+    trackPluginCatalogRequest(message);
+    if (message?.type === "ready") {{
+      state.routesMounted = true;
+      state.routesMountedAtMs = Math.round(performance.now());
+      return;
+    }}
+    if (message?.type !== "fetch"
+      || String(message.method).toUpperCase() !== "POST"
+      || message.url !== "/wham/statsig/bootstrap") return;
+    try {{
+      const payload = buildBootstrapPayload();
+      if (!payload) return;
+      dispatchFetchResponse(message, {{ statsigPayload: payload }});
+      state.bootstrapIntercepted = true;
+      state.bootstrapInterceptedAtMs = Math.round(performance.now());
+    }} catch (error) {{
+      state.bootstrapSource = "intercept-error";
+      state.bootstrapError = String(error?.stack ?? error);
+    }}
+  }});
+  state.pluginCatalogBridgeInstalled = true;
+  state.refreshPluginCatalogCache = refreshPluginCatalogCache;
+  queueMicrotask(refreshPluginCatalogCache);
+
+  const PLUGIN_DIRECTORY_LINK_ID = "chatroute-plugin-directory-link";
+  let pluginDirectoryLinkScheduled = false;
+  const findReactRouterNavigator = () => {{
+    const elements = document.querySelectorAll("button,main,[role='main']");
+    for (const element of elements) {{
+      const reactKey = Object.getOwnPropertyNames(element).find((name) =>
+        name.startsWith("__reactFiber$") || name.startsWith("__reactInternalInstance$"));
+      if (!reactKey) continue;
+      let fiber = element[reactKey];
+      for (let level = 0; fiber && level < 300; level += 1, fiber = fiber.return) {{
+        for (const value of [fiber.memoizedProps, fiber.pendingProps, fiber.memoizedState]) {{
+          if (value?.navigator && typeof value.navigator.push === "function") {{
+            return value.navigator;
+          }}
+        }}
+        for (let dependency = fiber.dependencies?.firstContext;
+          dependency;
+          dependency = dependency.next) {{
+          const value = dependency.memoizedValue;
+          if (value?.navigator && typeof value.navigator.push === "function") {{
+            return value.navigator;
+          }}
+        }}
+      }}
+    }}
+    return null;
+  }};
+  const openPluginDirectory = () => {{
+    try {{
+      const navigator = findReactRouterNavigator();
+      if (!navigator) throw new Error("React Router navigator unavailable");
+      navigator.push("/plugins");
+      state.pluginDirectoryLinkError = null;
+    }} catch (error) {{
+      state.pluginDirectoryLinkError = String(error?.stack ?? error);
+    }}
+  }};
+  const installPluginDirectoryLink = () => {{
+    pluginDirectoryLinkScheduled = false;
+    try {{
+      const existingLink = document.getElementById(PLUGIN_DIRECTORY_LINK_ID);
+      const searchInput = document.getElementById("plugins-page-manage-search");
+      if (!searchInput) {{
+        existingLink?.remove();
+        state.pluginDirectoryLinkInstalled = false;
+        return;
+      }}
+      if (existingLink?.isConnected) {{
+        const isChinese = document.documentElement.lang.toLowerCase().startsWith("zh");
+        const label = isChinese ? "浏览插件" : "Browse plugins";
+        if (existingLink.textContent !== label) existingLink.textContent = label;
+        return;
+      }}
+      const searchContainer = searchInput?.parentElement;
+      const toolbar = searchContainer?.parentElement;
+      if (!(toolbar instanceof HTMLElement) || !(searchContainer instanceof HTMLElement)) return;
+      const link = document.createElement("button");
+      link.id = PLUGIN_DIRECTORY_LINK_ID;
+      link.type = "button";
+      link.textContent = document.documentElement.lang.toLowerCase().startsWith("zh")
+        ? "浏览插件"
+        : "Browse plugins";
+      link.setAttribute("aria-label", link.textContent);
+      link.style.cssText = [
+        "height:32px",
+        "padding:0 12px",
+        "border:1px solid var(--color-token-border-default, rgba(0,0,0,.14))",
+        "border-radius:6px",
+        "background:var(--color-token-button-secondary-background, transparent)",
+        "color:var(--color-token-text-primary, inherit)",
+        "font:inherit",
+        "font-size:14px",
+        "cursor:pointer",
+        "white-space:nowrap",
+      ].join(";");
+      link.addEventListener("click", openPluginDirectory);
+      toolbar.insertBefore(link, searchContainer);
+      state.pluginDirectoryLinkInstalled = true;
+      state.pluginDirectoryLinkError = null;
+    }} catch (error) {{
+      state.pluginDirectoryLinkError = String(error?.stack ?? error);
+    }}
+  }};
+  const schedulePluginDirectoryLink = () => {{
+    if (pluginDirectoryLinkScheduled) return;
+    pluginDirectoryLinkScheduled = true;
+    queueMicrotask(installPluginDirectoryLink);
+  }};
+  try {{
+    // Keep the observer and target in the same renderer realm. Newer Codex App
+    // builds can expose the injected global and the page DOM through different
+    // realms, making a global MutationObserver reject documentElement as a Node.
+    const PageMutationObserver = document.defaultView?.MutationObserver;
+    const pluginDirectoryRoot = document.documentElement;
+    if (typeof PageMutationObserver !== "function" || !pluginDirectoryRoot) {{
+      throw new Error("Plugin directory observer is unavailable");
+    }}
+    new PageMutationObserver(schedulePluginDirectoryLink).observe(pluginDirectoryRoot, {{
+      childList: true,
+      subtree: true,
+    }});
+  }} catch (error) {{
+    // The directory shortcut is optional. A renderer compatibility issue here
+    // must not abort model, language, Statsig, or plugin catalog enhancement.
+    state.pluginDirectoryLinkError = String(error?.stack ?? error);
+  }}
+  window.addEventListener("popstate", schedulePluginDirectoryLink);
+  schedulePluginDirectoryLink();
+
+  Storage.prototype.getItem = function(key) {{
+    const raw = originalGetItem.call(this, key);
+    return typeof key === "string" && key.startsWith("statsig.cached.evaluations.")
+      ? patchSerialized(raw)
+      : raw;
+  }};
+
+  const patchCachedI18nLayer = (layer, value) => {{
+    if (!layer || typeof layer !== "object") return;
+    const marker = "__CHATROUTE_I18N_VALUE__";
+    let control = layer[marker];
+    if (!control) {{
+      control = {{ fallback: typeof layer.get === "function" ? layer.get.bind(layer) : null, value }};
+      layer[marker] = control;
+      layer.get = (key, fallback) => Object.prototype.hasOwnProperty.call(control.value, key)
+        ? control.value[key]
+        : control.fallback?.(key, fallback) ?? fallback;
+    }}
+    control.value = value;
+    layer.__value = value;
+  }};
+
+  const patchPublicModelConfig = (name, config) => {{
+    const value = config?.value;
+    const schemaMatch = isModelConfigValue(value);
+    const idMatch = String(name) === state.modelConfigId;
+    if (!schemaMatch && !idMatch) return config;
+    if (schemaMatch && (!state.modelConfigSupported || state.modelConfigId !== String(name))) {{
+      state.modelConfigId = String(name);
+      state.modelConfigSource = "public-schema";
+      state.modelConfigSupported = true;
+    }}
+    if (!state.modelConfigSupported) return config;
+    const nextValue = {{
+      ...(isObject(value) ? value : {{}}),
+      available_models: state.models,
+      default_model: state.models[0] ?? value?.default_model ?? "gpt-5.6-sol",
+      use_hidden_models: false,
+    }};
+    try {{
+      config.value = nextValue;
+      return config;
+    }} catch {{
+      return {{ ...(isObject(config) ? config : {{}}), value: nextValue }};
+    }}
+  }};
+
+  const patchPublicI18nLayer = (name, layer) => {{
+    if (!layer || typeof layer !== "object") return layer;
+    const probe = {{}};
+    let enableI18n = probe;
+    let localeSource = "FIRST_AVAILABLE";
+    try {{
+      enableI18n = layer.get?.("enable_i18n", probe) ?? probe;
+      localeSource = layer.get?.("locale_source", "FIRST_AVAILABLE") ?? "FIRST_AVAILABLE";
+    }} catch {{}}
+    const schemaMatch = enableI18n !== probe
+      || isI18nLayerValue(layer.value)
+      || isI18nLayerValue(layer.__value);
+    const idMatch = String(name) === state.i18nLayerId;
+    if (!schemaMatch && !idMatch) return layer;
+    if (schemaMatch && (!state.i18nLayerSupported || state.i18nLayerId !== String(name))) {{
+      state.i18nLayerId = String(name);
+      state.i18nLayerSource = "public-schema";
+      state.i18nLayerSupported = true;
+    }}
+    if (!state.i18nLayerSupported) return layer;
+    patchCachedI18nLayer(layer, {{
+      ...(isObject(layer.value) ? layer.value : {{}}),
+      ...(isObject(layer.__value) ? layer.__value : {{}}),
+      enable_i18n: true,
+      locale_source: localeSource,
+    }});
+    return layer;
+  }};
+
+  const PUBLIC_API_PATCH_MARKER = "__CHATROUTE_ENHANCED_PUBLIC_API_PATCH__";
+  const installPublicApiOverlay = (client) => {{
+    if (!client || typeof client !== "object") return false;
+    const previous = client[PUBLIC_API_PATCH_MARKER];
+    if (previous?.version === 1) {{
+      previous.shouldApply = () => usableBaseForClient(client);
+      previous.patchModel = patchPublicModelConfig;
+      previous.patchI18n = patchPublicI18nLayer;
+      previous.forceGate = (name) => compatibilityReady()
+        && SUPPORTED_GATES.includes(String(name));
+      recordAdapter("statsig-public-api");
+      return true;
+    }}
+    const control = {{
+      version: 1,
+      shouldApply: () => usableBaseForClient(client),
+      patchModel: patchPublicModelConfig,
+      patchI18n: patchPublicI18nLayer,
+      forceGate: (name) => compatibilityReady() && SUPPORTED_GATES.includes(String(name)),
+    }};
+    let installed = false;
+    if (typeof client.getDynamicConfig === "function") {{
+      control.getDynamicConfig = previous?.getDynamicConfig
+        ?? client.getDynamicConfig.bind(client);
+      try {{
+        client.getDynamicConfig = (name, ...args) => {{
+          const result = control.getDynamicConfig(name, ...args);
+          return control.shouldApply()
+            ? control.patchModel(name, result)
+            : result;
+        }};
+        installed = true;
+      }} catch {{}}
+    }}
+    if (typeof client.getLayer === "function") {{
+      control.getLayer = previous?.getLayer ?? client.getLayer.bind(client);
+      try {{
+        client.getLayer = (name, ...args) => {{
+          const result = control.getLayer(name, ...args);
+          return control.shouldApply()
+            ? control.patchI18n(name, result)
+            : result;
+        }};
+        installed = true;
+      }} catch {{}}
+    }}
+    if (typeof client.checkGate === "function") {{
+      control.checkGate = previous?.checkGate ?? client.checkGate.bind(client);
+      try {{
+        client.checkGate = (name, ...args) => control.shouldApply()
+          && control.forceGate(name)
+          ? true
+          : control.checkGate(name, ...args);
+        installed = true;
+      }} catch {{}}
+    }}
+    if (!installed) return false;
+    try {{ client[PUBLIC_API_PATCH_MARKER] = control; }} catch {{}}
+    recordAdapter("statsig-public-api");
+    return true;
+  }};
+
+  const invalidateI18nReactCache = (i18nValue) => {{
+    const rootElement = document.getElementById("root");
+    const containerKey = Object.getOwnPropertyNames(rootElement ?? {{}})
+      .find((key) => key.startsWith("__reactContainer"));
+    const container = containerKey ? rootElement?.[containerKey] : null;
+    const rootFiber = container?.stateNode?.current ?? container;
+    if (!rootFiber) return 0;
+
+    const stack = [rootFiber];
+    const seenFibers = new Set();
+    const seenRows = new Set();
+    let invalidated = 0;
+    while (stack.length > 0) {{
+      const fiber = stack.pop();
+      if (!fiber || seenFibers.has(fiber)) continue;
+      seenFibers.add(fiber);
+      for (const candidate of [fiber, fiber.alternate]) {{
+        const rows = candidate?.updateQueue?.memoCache?.data;
+        if (!Array.isArray(rows)) continue;
+        for (const row of rows) {{
+          if (!Array.isArray(row) || seenRows.has(row)) continue;
+          seenRows.add(row);
+          for (let index = 0; index < row.length - 1; index += 1) {{
+            const layer = row[index];
+            if (String(layer?.name) !== state.i18nLayerId || typeof layer.get !== "function") continue;
+            patchCachedI18nLayer(layer, i18nValue);
+            if (typeof row[index + 1] === "boolean" && row[index + 1] !== true) {{
+              row[index] = null;
+              invalidated += 1;
+            }}
+          }}
+        }}
+      }}
+      if (fiber.sibling) stack.push(fiber.sibling);
+      if (fiber.child) stack.push(fiber.child);
+    }}
+    state.i18nReactCacheInvalidated =
+      (state.i18nReactCacheInvalidated ?? 0) + invalidated;
+    return invalidated;
+  }};
+
+  const resolveClientState = (client) => {{
+    const resolvedConfig = client.getDynamicConfig?.(state.modelConfigId)?.value;
+    const resolvedI18n = client.getLayer?.(state.i18nLayerId);
+    state.applied = compatibilityReady()
+      && resolvedConfig?.use_hidden_models === false
+      && JSON.stringify(resolvedConfig.available_models) === JSON.stringify(state.models)
+      && resolvedI18n?.get?.("enable_i18n", false) === true
+      && SUPPORTED_GATES.every((gate) => client.checkGate?.(gate) === true);
+    state.client = client;
+    return state.applied;
+  }};
+
+  const applyClient = (client) => {{
+    if (!client || typeof client !== "object") return false;
+    installClientPatches(client);
+    if (!client?._store?.setValues || typeof client._finalizeUpdate !== "function") {{
+      if (!usableBaseForClient(client)) return false;
+      if (state.officialBaseAvailable) restoreOfficialInitializeUrl(client);
+      const i18n = client.getLayer?.(state.i18nLayerId);
+      const i18nValue = {{ enable_i18n: true, locale_source: "FIRST_AVAILABLE" }};
+      patchCachedI18nLayer(i18n, i18nValue);
+      if (state.i18nReactCacheInvalidated === 0) invalidateI18nReactCache(i18nValue);
+      return resolveClientState(client);
+    }}
+    let current = client._store.getValues?.();
+    if (!isUsableBaseValues(current)) {{
+      current = recoverOfficialValuesFromCache(client);
+    }}
+    if (!isUsableBaseValues(current)) return false;
+    markBaseAvailability(current);
+    if (isCompleteOfficialValues(current)) restoreOfficialInitializeUrl(client);
+    discoverConfigIds(current);
+    current.feature_gates ??= {{}};
+    current.dynamic_configs ??= {{}};
+    current.layer_configs ??= {{}};
+    current.values ??= {{}};
+    const currentConfigEntry = current.dynamic_configs[state.modelConfigId];
+    const currentConfig = currentConfigEntry?.v
+      && current.values?.[currentConfigEntry.v]
+      && typeof current.values[currentConfigEntry.v] === "object"
+      ? current.values[currentConfigEntry.v]
+      : currentConfigEntry?.value;
+    const currentI18nEntry = current.layer_configs[state.i18nLayerId];
+    const currentI18n = currentI18nEntry?.v
+      && current.values?.[currentI18nEntry.v]
+      && typeof current.values[currentI18nEntry.v] === "object"
+      ? current.values[currentI18nEntry.v]
+      : currentI18nEntry?.value;
+    const gateEnabled = (gate) => current.feature_gates?.[gate]?.v === true
+      || current.feature_gates?.[gate]?.value === true;
+    const alreadyApplied = currentConfig?.use_hidden_models === false
+      && JSON.stringify(currentConfig.available_models) === JSON.stringify(state.models)
+      && currentI18n?.enable_i18n === true
+      && SUPPORTED_GATES.every(gateEnabled);
+    const cachedI18nLayer = client.getLayer?.(state.i18nLayerId);
+    const publicI18nEnabled = cachedI18nLayer?.get?.("enable_i18n", false) === true;
+    const next = patchValues(structuredClone(current));
+    const nextI18nEntry = next.layer_configs[state.i18nLayerId];
+    const nextI18nValue = nextI18nEntry?.value
+      ?? next.values?.[nextI18nEntry?.v]
+      ?? {{ enable_i18n: true, locale_source: "FIRST_AVAILABLE" }};
+    patchCachedI18nLayer(cachedI18nLayer, nextI18nValue);
+    const invalidatedI18nCache = state.i18nReactCacheInvalidated > 0
+      ? 0
+      : invalidateI18nReactCache(nextI18nValue);
+    if (!alreadyApplied || !publicI18nEnabled || invalidatedI18nCache > 0) {{
+      const packet = {{
+        data: JSON.stringify(next),
+        source: ["Loading", "NoValues", "Uninitialized"].includes(client._store.getSource?.())
+          ? "Bootstrap"
+          : client._store.getSource?.() ?? "Bootstrap",
+        receivedAt: Date.now(),
+      }};
+      if (!client._store.setValues(packet, client._user)) return false;
+      client._finalizeUpdate(packet);
+    }}
+    return resolveClientState(client);
+  }};
+
+  const attach = () => {{
+    state.attempts += 1;
+    const client = state.client ?? findStatsigClients()[0];
+    if (!client) {{
+      if (state.attempts < 300) setTimeout(attach, state.attempts < 80 ? 25 : 100);
+      return;
+    }}
+    installClientPatches(client);
+    if (client.__CHATROUTE_ENHANCED_LISTENER_VERSION__ !== SCRIPT_VERSION) {{
+      const listener = () => {{
+        if (state.applying) return;
+        state.applying = true;
+        try {{
+          if (!applyClient(client)) queueMicrotask(attach);
+        }} finally {{ state.applying = false; }}
+      }};
+      state.listener = listener;
+      client.__CHATROUTE_ENHANCED_LISTENER_VERSION__ = SCRIPT_VERSION;
+      client.on?.("values_updated", listener);
+    }}
+    if (!applyClient(client) && state.attempts < 300) {{
+      setTimeout(attach, state.attempts < 80 ? 25 : 100);
+    }}
+  }};
+  state.update = (models) => {{
+    state.models = models;
+    state.applied = false;
+    state.attempts = 0;
+    queueMicrotask(attach);
+  }};
+  hookStatsigGlobal();
+  queueMicrotask(attach);
+}})();"#
+    ))
+}
+
+async fn launch_codex_app(port: u16) -> Result<()> {
+    tokio::task::spawn_blocking(move || launch_codex_app_blocking(port))
+        .await
+        .context("启动 Codex App 任务失败")??;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+const CODEX_APP_USER_MODEL_ID: &str = "OpenAI.Codex_2p2nqsd0c76g0!App";
+
+#[cfg(target_os = "windows")]
+const IID_IAPPLICATION_ACTIVATION_MANAGER: windows_sys::core::GUID =
+    windows_sys::core::GUID::from_u128(0x2e941141_7f97_4756_ba1d_9decde894a3d);
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct ApplicationActivationManagerInterface {
+    vtable: *const ApplicationActivationManagerVtable,
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+#[repr(C)]
+struct ApplicationActivationManagerVtable {
+    query_interface: unsafe extern "system" fn(
+        *mut ApplicationActivationManagerInterface,
+        *const windows_sys::core::GUID,
+        *mut *mut std::ffi::c_void,
+    ) -> windows_sys::core::HRESULT,
+    add_ref: unsafe extern "system" fn(*mut ApplicationActivationManagerInterface) -> u32,
+    release: unsafe extern "system" fn(*mut ApplicationActivationManagerInterface) -> u32,
+    activate_application: unsafe extern "system" fn(
+        *mut ApplicationActivationManagerInterface,
+        *const u16,
+        *const u16,
+        u32,
+        *mut u32,
+    ) -> windows_sys::core::HRESULT,
+}
+
+#[cfg(target_os = "windows")]
+struct ComApartmentGuard {
+    should_uninitialize: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ComApartmentGuard {
+    fn drop(&mut self) {
+        if self.should_uninitialize {
+            unsafe { windows_sys::Win32::System::Com::CoUninitialize() };
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct ApplicationActivationManagerHandle(*mut ApplicationActivationManagerInterface);
+
+#[cfg(target_os = "windows")]
+impl Drop for ApplicationActivationManagerHandle {
+    fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        let vtable = unsafe { (*self.0).vtable };
+        if !vtable.is_null() {
+            unsafe { ((*vtable).release)(self.0) };
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn initialize_com_apartment() -> Result<ComApartmentGuard> {
+    use windows_sys::Win32::{
+        Foundation::RPC_E_CHANGED_MODE,
+        System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx},
+    };
+
+    let result = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+    if result < 0 && result != RPC_E_CHANGED_MODE {
+        bail!("Windows COM 初始化失败（HRESULT 0x{:08X}）", result as u32);
+    }
+    Ok(ComApartmentGuard {
+        should_uninitialize: result >= 0,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn create_application_activation_manager() -> Result<ApplicationActivationManagerHandle> {
+    use windows_sys::Win32::{
+        System::Com::{CLSCTX_LOCAL_SERVER, CoCreateInstance},
+        UI::Shell::ApplicationActivationManager,
+    };
+
+    let mut raw = std::ptr::null_mut();
+    let result = unsafe {
+        CoCreateInstance(
+            &ApplicationActivationManager,
+            std::ptr::null_mut(),
+            CLSCTX_LOCAL_SERVER,
+            &IID_IAPPLICATION_ACTIVATION_MANAGER,
+            &mut raw,
+        )
+    };
+    if result < 0 || raw.is_null() {
+        bail!(
+            "Windows 应用激活服务不可用（HRESULT 0x{:08X}）",
+            result as u32
+        );
+    }
+    Ok(ApplicationActivationManagerHandle(raw.cast()))
+}
+
+#[cfg(target_os = "windows")]
+fn wide_null_terminated(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn codex_app_activation_arguments(port: u16) -> String {
+    format!("--remote-debugging-address=127.0.0.1 --remote-debugging-port={port}")
+}
+
+#[cfg(target_os = "windows")]
+fn launch_codex_app_blocking(port: u16) -> Result<()> {
+    let _apartment = initialize_com_apartment()?;
+    let manager = create_application_activation_manager()?;
+    let app_id = wide_null_terminated(CODEX_APP_USER_MODEL_ID);
+    let arguments = wide_null_terminated(&codex_app_activation_arguments(port));
+    let mut process_id = 0_u32;
+    let vtable = unsafe { (*manager.0).vtable };
+    if vtable.is_null() {
+        bail!("Windows 应用激活服务返回了无效接口");
+    }
+    let result = unsafe {
+        ((*vtable).activate_application)(
+            manager.0,
+            app_id.as_ptr(),
+            arguments.as_ptr(),
+            0,
+            &mut process_id,
+        )
+    };
+    if result < 0 {
+        bail!(
+            "Windows 无法激活 Codex App 商店包 {CODEX_APP_USER_MODEL_ID}（HRESULT 0x{:08X}）",
+            result as u32
+        );
+    }
+    chain_log::write_line(format!(
+        "[codex_app_enhanced] event=windows_native_activation process_id={process_id} port={port}"
+    ));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn launch_codex_app_blocking(port: u16) -> Result<()> {
+    let arguments = format!("--remote-debugging-address=127.0.0.1 --remote-debugging-port={port}");
+    for app_name in ["Codex", "ChatGPT"] {
+        let status = Command::new("open")
+            .args(["-na", app_name, "--args"])
+            .args(arguments.split_whitespace())
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    bail!("macOS 无法定位 Codex App")
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn launch_codex_app_blocking(_port: u16) -> Result<()> {
+    bail!("增强模式启动当前仅支持 Windows 和 macOS")
+}
+
+#[cfg(target_os = "windows")]
+fn codex_app_is_running() -> Result<bool> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        let error = unsafe { GetLastError() };
+        return tasklist_codex_app_is_running(&format!(
+            "CreateToolhelp32Snapshot failed with Windows error {error}"
+        ));
+    }
+
+    let result = (|| {
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if unsafe { Process32FirstW(snapshot, &mut entry) } == 0 {
+            let error = unsafe { GetLastError() };
+            bail!("Process32FirstW failed with Windows error {error}");
+        }
+        loop {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|value| *value == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            if name.eq_ignore_ascii_case("ChatGPT.exe") || name.eq_ignore_ascii_case("Codex.exe") {
+                return Ok(true);
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                break;
+            }
+        }
+        Ok(false)
+    })();
+    unsafe { CloseHandle(snapshot) };
+
+    match result {
+        Ok(running) => Ok(running),
+        Err(err) => tasklist_codex_app_is_running(&err.to_string()),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn tasklist_codex_app_is_running(native_error: &str) -> Result<bool> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let tasklist = std::env::var_os("WINDIR")
+        .map(|root| {
+            std::path::PathBuf::from(root)
+                .join("System32")
+                .join("tasklist.exe")
+        })
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| std::path::PathBuf::from("tasklist.exe"));
+    let output = Command::new(&tasklist)
+        .args(["/FO", "CSV", "/NH"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .with_context(|| format!("原生进程枚举失败（{native_error}），无法启动 {tasklist:?}"))?;
+    if !output.status.success() {
+        bail!(
+            "原生进程枚举失败（{native_error}），tasklist 退出码 {}",
+            output.status.code().unwrap_or(-1)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.to_ascii_lowercase().contains("chatgpt.exe"))
+        || String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.to_ascii_lowercase().contains("codex.exe")))
+}
+
+#[cfg(target_os = "macos")]
+fn codex_app_is_running() -> Result<bool> {
+    for name in ["Codex", "ChatGPT"] {
+        if Command::new("pgrep").args(["-x", name]).status()?.success() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn codex_app_is_running() -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enhanced_script_embeds_models_and_only_patches_selected_statsig_sections() {
+        let script = enhanced_statsig_script(
+            &["gpt-5.6-sol".into(), "grok-4.6".into()],
+            "http://127.0.0.1:3847/api",
+        )
+        .expect("script");
+        assert!(script.contains("gpt-5.6-sol"));
+        assert!(script.contains("grok-4.6"));
+        assert!(script.contains("107580212"));
+        assert!(!SUPPORTED_FEATURE_GATES.contains(&"824038554"));
+        assert!(SUPPORTED_FEATURE_GATES.contains(&"3446105535"));
+        assert!(LEGACY_CHATROUTE_FEATURE_GATES.contains(&"824038554"));
+        assert!(!LEGACY_CHATROUTE_FEATURE_GATES.contains(&"3446105535"));
+        assert!(script.contains("72216192"));
+        assert!(script.contains("enable_i18n: true"));
+        assert!(script.contains("response_format = \"init-v2\""));
+        assert!(script.contains("const modelIsV2"));
+        assert!(script.contains("installStorePatch"));
+        assert!(script.contains("patchCachedI18nLayer"));
+        assert!(script.contains("SCRIPT_VERSION = 21"));
+        assert!(script.contains("state.pluginCatalogCacheRefreshAttempts < 240"));
+        assert!(script.contains("state.pluginCatalogCacheRefreshAttempts < 80 ? 25 : 250"));
+        assert!(script.contains("PLUGIN_DIRECTORY_LINK_ID"));
+        assert!(script.contains("plugins-page-manage-search"));
+        assert!(script.contains("findReactRouterNavigator"));
+        assert!(script.contains("navigator.push(\"/plugins\")"));
+        assert!(script.contains("document.defaultView?.MutationObserver"));
+        assert!(script.contains("Plugin directory observer is unavailable"));
+        assert!(script.contains("http://127.0.0.1:3847/codex-app/statsig/v1/initialize"));
+        assert!(script.contains("installLocalInitializePatch"));
+        assert!(script.contains("_initializeUrlConfig"));
+        assert!(script.contains("urlConfig.customUrl = LOCAL_STATSIG_INITIALIZE_URL"));
+        assert!(script.contains("local-statsig-initialize"));
+        assert!(script.contains("originalInitializeUrls = new WeakMap()"));
+        assert!(script.contains("restoreOfficialInitializeUrl"));
+        assert!(script.contains("official-statsig-refresh"));
+        assert!(script.contains("isCompleteChatRouteValues"));
+        assert!(script.contains("isUsableBaseValues"));
+        assert!(script.contains("DEFAULT_MODEL_CONFIG_ID = \"107580212\""));
+        assert!(script.contains("DEFAULT_I18N_LAYER_ID = \"72216192\""));
+        assert!(script.contains("discoverConfigIds"));
+        assert!(script.contains("isModelConfigValue"));
+        assert!(script.contains("isI18nLayerValue"));
+        assert!(script.contains("modelConfigSource = \"schema\""));
+        assert!(script.contains("i18nLayerSource = \"schema\""));
+        assert!(!script.contains("current.dynamic_configs[CONFIG_ID]"));
+        assert!(!script.contains("current.layer_configs[\"72216192\"]"));
+        assert!(script.contains("isCompleteOfficialValues"));
+        assert!(script.contains("selectOfficialBootstrap"));
+        assert!(script.contains("recoverOfficialValuesFromCache"));
+        assert!(script.contains("statsig-cache-late-prelogin"));
+        assert!(script.contains("statsig-cache-late-local"));
+        assert!(script.contains("statsig-cache-late-other"));
+        assert!(script.contains("current = recoverOfficialValuesFromCache(client)"));
+        assert!(script.contains("? \"local-network\""));
+        assert!(script.contains(": \"official-network\""));
+        assert!(script.contains("installFastInitializePatch"));
+        assert!(script.contains("client.initializeSync({ disableBackgroundCacheRefresh: true })"));
+        assert!(script.contains("fastInitializeAppliedAtMs"));
+        assert!(script.contains("if (!isUsableBaseValues(current))"));
+        assert!(script.contains("return isCompleteOfficialValues(recovered) ? recovered : values"));
+        assert!(!script.contains("JSON.parse(buildBootstrapPayload())"));
+        assert!(!script.contains("chatroute-minimal-store"));
+        assert!(script.contains("installPublicApiOverlay"));
+        assert!(script.contains("statsig-public-api"));
+        assert!(script.contains("usableBaseForClient"));
+        assert!(script.contains("if (!usableBaseForClient(client)) return false"));
+        assert!(script.contains("if (!state.modelConfigSupported || !state.i18nLayerSupported)"));
+        assert!(script.contains("state.compatibilityFailure = `unsupported Statsig schema"));
+        assert!(script.contains("if (isUsableBaseValues(values))"));
+        assert!(script.contains("if (!compatibilityReady())"));
+        assert!(script.contains("findStatsigClients"));
+        assert!(script.contains("typeof statsig.instance === \"function\""));
+        assert!(script.contains("invalidateI18nReactCache"));
+        assert!(script.contains("__reactContainer"));
+        assert!(script.contains("memoCache?.data"));
+        assert!(script.contains("invalidatedI18nCache > 0"));
+        assert!(script.contains("const hasV1Entries"));
+        assert!(script.contains("delete values.response_format"));
+        assert!(script.contains("delete nextConfig.value"));
+        assert!(script.contains("delete nextConfig.v"));
+        assert!(script.contains("LEGACY_CHATROUTE_GATES"));
+        assert!(script.contains("current?.rule_id === \"chatroute-local\""));
+        assert!(script.contains("delete values.feature_gates[gate]"));
+        assert!(!script.contains("state.gates.every"));
+        assert!(script.contains("/wham/statsig/bootstrap"));
+        assert!(script.contains("codex-message-from-view"));
+        assert!(script.contains("LOCAL_CURATED_MARKETPLACE = \"openai-curated\""));
+        assert!(script.contains("LOCAL_CURATED_RENDERER_ALIAS = \"codex-official\""));
+        assert!(script.contains("message?.type === \"mcp-request\""));
+        assert!(script.contains("message.request?.method === \"plugin/list\""));
+        assert!(script.contains("message?.type === \"mcp-response\""));
+        assert!(script.contains("message.message ?? message.response"));
+        assert!(script.contains("response?.result"));
+        assert!(script.contains("message.url === \"vscode://codex/list-plugins\""));
+        assert!(script.contains("adaptLocalCuratedPluginCatalog"));
+        assert!(script.contains("typeof marketplace.path !== \"string\""));
+        assert!(script.contains("marketplace.name = LOCAL_CURATED_RENDERER_ALIAS"));
+        assert!(script.contains("installPluginCatalogDispatchPatch"));
+        assert!(script.contains("existing.installPluginCatalogDispatchPatch?.()"));
+        assert!(script.contains("chatRoutePluginDispatchEvent"));
+        assert!(script.contains("adaptPluginCatalogResponseData(event.data)"));
+        assert!(script.contains("findReactQueryClient"));
+        assert!(script.contains("queryClient.invalidateQueries"));
+        assert!(script.contains("queryKey: [\"plugins\"]"));
+        assert!(script.contains("refetchType: \"active\""));
+        assert!(script.contains("state.refreshPluginCatalogCache = refreshPluginCatalogCache"));
+        assert!(script.contains(
+            "state.installPluginCatalogDispatchPatch = installPluginCatalogDispatchPatch"
+        ));
+        assert!(script.contains("state.pluginCatalogBridgeInstalled = true"));
+        assert!(script.contains("state.pluginCatalogDispatchPatched = true"));
+        assert!(script.contains("state.pluginCatalogResponsesAdapted += 1"));
+        assert!(!script.contains("LOCAL_CURATED_MARKETPLACE = \"openai-curated-remote\""));
+        assert!(script.contains("routesMountedAtMs"));
+        assert!(script.contains("values.layer_configs[i18nLayerId]"));
+    }
+
+    #[test]
+    fn enhanced_install_executes_in_place_without_reloading_codex_app() {
+        let commands = enhanced_script_install_commands("window.testEnhanced = true;");
+        let methods = commands
+            .iter()
+            .map(|(method, _)| *method)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            methods,
+            vec!["Runtime.evaluate", "Page.addScriptToEvaluateOnNewDocument"]
+        );
+        assert!(!methods.contains(&"Page.reload"));
+        assert_eq!(commands[0].1["expression"], "window.testEnhanced = true;");
+    }
+
+    #[test]
+    fn early_attach_installs_before_releasing_renderer() {
+        let target = AttachedTarget {
+            session_id: "session".into(),
+            target_id: "renderer".into(),
+            target_type: "page".into(),
+            url: "app://-/index.html".into(),
+            waiting_for_debugger: true,
+        };
+        let commands = attached_target_commands(&target, "window.testEnhanced = true;");
+        let methods = commands
+            .iter()
+            .map(|(method, _)| *method)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            methods,
+            vec![
+                "Page.addScriptToEvaluateOnNewDocument",
+                "Runtime.runIfWaitingForDebugger"
+            ]
+        );
+        assert_eq!(commands[0].1["source"], "window.testEnhanced = true;");
+        assert!(!methods.contains(&"Runtime.evaluate"));
+        assert!(!methods.contains(&"Page.reload"));
+    }
+
+    #[test]
+    fn early_attach_releases_non_renderer_targets_without_injecting() {
+        let target = AttachedTarget {
+            session_id: "worker-session".into(),
+            target_id: "worker".into(),
+            target_type: "worker".into(),
+            url: "blob:worker".into(),
+            waiting_for_debugger: true,
+        };
+        let commands = attached_target_commands(&target, "window.testEnhanced = true;");
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].0, "Runtime.runIfWaitingForDebugger");
+    }
+
+    #[test]
+    fn late_browser_attach_keeps_the_existing_in_place_fallback() {
+        let target = AttachedTarget {
+            session_id: "session".into(),
+            target_id: "renderer".into(),
+            target_type: "page".into(),
+            url: "app://-/index.html".into(),
+            waiting_for_debugger: false,
+        };
+        let methods = attached_target_commands(&target, "window.testEnhanced = true;")
+            .into_iter()
+            .map(|(method, _)| method)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            methods,
+            vec!["Runtime.evaluate", "Page.addScriptToEvaluateOnNewDocument"]
+        );
+        assert!(!methods.contains(&"Page.reload"));
+    }
+
+    #[test]
+    fn attached_target_event_is_parsed_for_flattened_sessions() {
+        let event = json!({
+            "method": "Target.attachedToTarget",
+            "params": {
+                "sessionId": "session-1",
+                "waitingForDebugger": true,
+                "targetInfo": {
+                    "targetId": "target-1",
+                    "type": "page",
+                    "url": "app://-/index.html"
+                }
+            }
+        });
+
+        assert_eq!(
+            attached_target_from_event(&event),
+            Some(AttachedTarget {
+                session_id: "session-1".into(),
+                target_id: "target-1".into(),
+                target_type: "page".into(),
+                url: "app://-/index.html".into(),
+                waiting_for_debugger: true,
+            })
+        );
+    }
+
+    #[test]
+    fn flattened_cdp_request_places_session_id_at_the_top_level() {
+        let request = cdp_request_value(
+            7,
+            Some("session-1"),
+            "Runtime.runIfWaitingForDebugger",
+            json!({}),
+        );
+
+        assert_eq!(request["id"], 7);
+        assert_eq!(request["sessionId"], "session-1");
+        assert_eq!(request["method"], "Runtime.runIfWaitingForDebugger");
+        assert!(request["params"].get("sessionId").is_none());
+    }
+
+    #[test]
+    fn enhanced_install_reports_runtime_script_exceptions() {
+        let result = json!({
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": { "description": "TypeError: failed" }
+            }
+        });
+
+        let error = ensure_runtime_evaluation_succeeded(&result).unwrap_err();
+        assert!(error.to_string().contains("TypeError: failed"));
+    }
+
+    #[test]
+    fn normalized_models_trims_and_deduplicates() {
+        assert_eq!(
+            normalized_models(vec![" grok-4.6 ".into(), "".into(), "grok-4.6".into()]),
+            vec!["grok-4.6"]
+        );
+    }
+
+    #[test]
+    fn cdp_list_urls_try_ipv4_before_ipv6() {
+        assert_eq!(
+            cdp_http_urls(9335, "/json/list"),
+            [
+                "http://127.0.0.1:9335/json/list".to_string(),
+                "http://[::1]:9335/json/list".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cdp_version_urls_format_ipv6_with_brackets() {
+        assert_eq!(
+            cdp_http_urls(9335, "json/version"),
+            [
+                "http://127.0.0.1:9335/json/version".to_string(),
+                "http://[::1]:9335/json/version".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv6_loopback_browser_websocket_is_accepted() {
+        let raw = "ws://[::1]:9335/devtools/browser/test";
+
+        assert_eq!(
+            validated_loopback_websocket_url(raw, 9335, "Codex browser").unwrap(),
+            raw
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_launcher_builds_native_activation_inputs() {
+        assert_eq!(CODEX_APP_USER_MODEL_ID, "OpenAI.Codex_2p2nqsd0c76g0!App");
+        assert_eq!(
+            codex_app_activation_arguments(9335),
+            "--remote-debugging-address=127.0.0.1 --remote-debugging-port=9335"
+        );
+        let encoded = wide_null_terminated("Codex");
+        assert_eq!(encoded.last(), Some(&0));
+        assert_eq!(
+            String::from_utf16(&encoded[..encoded.len() - 1]).unwrap(),
+            "Codex"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires an interactive Windows shell COM service"]
+    fn windows_native_activation_manager_is_available() {
+        let _apartment = initialize_com_apartment().expect("initialize COM apartment");
+        let manager = create_application_activation_manager().expect("create activation manager");
+        assert!(!manager.0.is_null());
+    }
+
+    #[test]
+    fn enhanced_config_ready_does_not_require_renderer_routes_or_bootstrap_interception() {
+        let expected_models = vec!["gpt-5.6-sol".to_string()];
+        let mut status = InjectedStatus {
+            script_installed: true,
+            script_applied: true,
+            script_version: Some(ENHANCED_SCRIPT_VERSION),
+            ready: true,
+            available_models: expected_models.clone(),
+            use_hidden_models: false,
+            key_gates_enabled: SUPPORTED_FEATURE_GATES.len(),
+            i18n_enabled: true,
+            fast_initialize_applied: false,
+            fast_initialize_source: None,
+            local_initialize_installed: true,
+            local_initialize_active: false,
+            local_initialize_url: Some(
+                "http://127.0.0.1:3847/codex-app/statsig/v1/initialize".into(),
+            ),
+            local_initialize_error: None,
+            local_base_available: false,
+            bootstrap_intercepted: false,
+            bootstrap_source: None,
+            model_config_id: Some("107580212".into()),
+            model_config_source: Some("schema".into()),
+            model_config_supported: true,
+            i18n_layer_id: Some("72216192".into()),
+            i18n_layer_source: Some("schema".into()),
+            i18n_layer_supported: true,
+            official_base_available: true,
+            compatibility_adapters: vec!["statsig-store".into()],
+            compatibility_failure: None,
+            store_source: Some("Bootstrap".into()),
+            script_attempts: 1,
+            routes_mounted: false,
+            renderer_ready_ms: None,
+            plugin_catalog_bridge_installed: true,
+            plugin_catalog_dispatch_patched: true,
+            plugin_catalog_responses_adapted: 0,
+            plugin_catalog_cache_refresh_attempted: true,
+            plugin_catalog_cache_refreshed: true,
+            plugin_catalog_cache_refresh_error: None,
+        };
+
+        assert!(injected_status_is_ready(&status, &expected_models));
+        let detail = injected_status_detail(&status);
+        assert!(detail.contains("store=Bootstrap"));
+        assert!(detail.contains("model=107580212:true"));
+        assert!(detail.contains("i18n=72216192:true"));
+        assert!(detail.contains("adapters=statsig-store"));
+        status.official_base_available = false;
+        status.local_base_available = true;
+        assert!(injected_status_is_ready(&status, &expected_models));
+        status.local_base_available = false;
+        assert!(!injected_status_is_ready(&status, &expected_models));
+        status.official_base_available = true;
+        status.i18n_enabled = false;
+        assert!(!injected_status_is_ready(&status, &expected_models));
+        status.i18n_enabled = true;
+        status.plugin_catalog_bridge_installed = false;
+        assert!(!injected_status_is_ready(&status, &expected_models));
+        status.plugin_catalog_bridge_installed = true;
+        status.plugin_catalog_dispatch_patched = false;
+        assert!(!injected_status_is_ready(&status, &expected_models));
+        status.plugin_catalog_dispatch_patched = true;
+        status.compatibility_adapters.clear();
+        assert!(!injected_status_is_ready(&status, &expected_models));
+    }
+
+    #[test]
+    fn cold_start_retries_after_the_script_attempt_window() {
+        let status = InjectedStatus {
+            script_installed: true,
+            script_applied: false,
+            script_version: Some(ENHANCED_SCRIPT_VERSION),
+            ready: false,
+            available_models: Vec::new(),
+            use_hidden_models: true,
+            key_gates_enabled: 0,
+            i18n_enabled: false,
+            fast_initialize_applied: false,
+            fast_initialize_source: None,
+            local_initialize_installed: false,
+            local_initialize_active: false,
+            local_initialize_url: None,
+            local_initialize_error: Some("Statsig initialize URL config is unavailable".into()),
+            local_base_available: false,
+            bootstrap_intercepted: false,
+            bootstrap_source: None,
+            model_config_id: None,
+            model_config_source: None,
+            model_config_supported: false,
+            i18n_layer_id: None,
+            i18n_layer_source: None,
+            i18n_layer_supported: false,
+            official_base_available: false,
+            compatibility_adapters: Vec::new(),
+            compatibility_failure: Some("unsupported Statsig schema".into()),
+            store_source: Some("NoValues".into()),
+            script_attempts: 300,
+            routes_mounted: false,
+            renderer_ready_ms: None,
+            plugin_catalog_bridge_installed: false,
+            plugin_catalog_dispatch_patched: false,
+            plugin_catalog_responses_adapted: 0,
+            plugin_catalog_cache_refresh_attempted: false,
+            plugin_catalog_cache_refreshed: false,
+            plugin_catalog_cache_refresh_error: None,
+        };
+
+        assert!(!should_reapply_script(&status, Duration::from_secs(2)));
+        assert!(should_reapply_script(
+            &status,
+            ENHANCED_SCRIPT_RETRY_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn target_replacement_is_detected_even_when_id_is_reused() {
+        let first = CdpTarget {
+            id: "renderer".into(),
+            target_type: "page".into(),
+            url: "app://-/index.html".into(),
+            web_socket_debugger_url: Some("ws://127.0.0.1:9335/devtools/page/first".into()),
+        };
+        let replacement = CdpTarget {
+            web_socket_debugger_url: Some("ws://127.0.0.1:9335/devtools/page/replacement".into()),
+            ..first.clone()
+        };
+
+        assert!(same_cdp_target(&first, &first));
+        assert!(!same_cdp_target(&first, &replacement));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a Codex App renderer already listening on CDP port 9335"]
+    async fn live_injects_models_into_codex_app() {
+        let preflight = preflight().await.expect("live preflight");
+        assert!(preflight.running);
+        let models = [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "grok-4.6",
+            "deepseek-v4-pro",
+            "deepseek-v4-flash",
+            "GLM-5.3",
+            "GLM-5.3-Flash",
+            "Opus-4.8",
+            "Sonnet-4.6",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let report = launch_and_inject(models, "http://127.0.0.1:3847/backend-api")
+            .await
+            .expect("live enhanced injection");
+        assert_eq!(report.available_models.len(), 12);
+        assert!(!report.use_hidden_models);
+        assert_eq!(report.key_gates_enabled, SUPPORTED_FEATURE_GATES.len());
+        assert!(report.i18n_enabled);
+        assert!(report.official_base_available || report.local_base_available);
+        assert!(report.model_config_supported);
+        assert!(report.i18n_layer_supported);
+        assert!(report.plugin_catalog_bridge_installed);
+        assert!(report.plugin_catalog_dispatch_patched);
+        assert!(!report.compatibility_adapters.is_empty());
+        assert!(report.compatibility_failure.is_none());
+        assert_eq!(report.model_config_id.as_deref(), Some("107580212"));
+        assert_eq!(report.i18n_layer_id.as_deref(), Some("72216192"));
+        let repeated = launch_and_inject(
+            report.available_models.clone(),
+            "http://127.0.0.1:3847/backend-api",
+        )
+        .await
+        .expect("repeat live enhanced injection");
+        assert_eq!(repeated.available_models, report.available_models);
+        assert_eq!(repeated.key_gates_enabled, SUPPORTED_FEATURE_GATES.len());
+        assert!(repeated.i18n_enabled);
+        assert!(repeated.official_base_available || repeated.local_base_available);
+        assert!(repeated.plugin_catalog_bridge_installed);
+        assert!(repeated.plugin_catalog_dispatch_patched);
+    }
+}

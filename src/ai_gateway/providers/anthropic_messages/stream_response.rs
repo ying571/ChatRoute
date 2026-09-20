@@ -1,0 +1,210 @@
+use std::collections::VecDeque;
+
+use axum::body::Bytes;
+use serde_json::{Value, json};
+
+use super::response::incomplete_details_for_stop_reason;
+use super::stream_events::{convert_anthropic_stream_usage, emit_sse, merge_i64_field};
+use super::stream_state::AnthropicStreamState;
+
+impl AnthropicStreamState {
+    pub(super) fn handle_message_start(&mut self, event: &Value, queue: &mut VecDeque<Bytes>) {
+        if self.has_started {
+            return;
+        }
+        self.has_started = true;
+        let message = event.get("message").unwrap_or(event);
+        if let Some(id) = message.get("id").and_then(Value::as_str) {
+            self.response_id = id.to_string();
+        }
+        if let Some(model) = message.get("model").and_then(Value::as_str) {
+            self.model = model.to_string();
+        }
+        if let Some(usage) = message
+            .get("usage")
+            .and_then(convert_anthropic_stream_usage)
+        {
+            self.merge_usage(usage);
+        }
+        self.emit_response_created(queue);
+        self.emit_response_in_progress(queue);
+    }
+
+    pub(super) fn handle_message_delta(&mut self, event: &Value) {
+        if let Some(delta) = event.get("delta") {
+            if let Some(stop_reason) = delta.get("stop_reason").and_then(Value::as_str) {
+                self.stop_reason = Some(stop_reason.to_string());
+            }
+        }
+        if let Some(usage) = event.get("usage").and_then(convert_anthropic_stream_usage) {
+            self.merge_usage(usage);
+        }
+    }
+
+    pub(super) fn ensure_started(&mut self, queue: &mut VecDeque<Bytes>) {
+        if self.has_started {
+            return;
+        }
+        self.has_started = true;
+        self.emit_response_created(queue);
+        self.emit_response_in_progress(queue);
+    }
+
+    pub(super) fn emit_response_created(&mut self, queue: &mut VecDeque<Bytes>) {
+        emit_sse(
+            queue,
+            "response.created",
+            json!({
+                "type": "response.created",
+                "sequence_number": self.next_seq(),
+                "response": self.response_object("in_progress"),
+            }),
+        );
+    }
+
+    pub(super) fn emit_response_in_progress(&mut self, queue: &mut VecDeque<Bytes>) {
+        emit_sse(
+            queue,
+            "response.in_progress",
+            json!({
+                "type": "response.in_progress",
+                "sequence_number": self.next_seq(),
+                "response": self.response_object("in_progress"),
+            }),
+        );
+    }
+
+    pub(super) fn emit_response_completed(&mut self, queue: &mut VecDeque<Bytes>) {
+        let status = match self.stop_reason.as_deref() {
+            Some("max_tokens") => "incomplete",
+            _ => "completed",
+        };
+        let event_type = if status == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        emit_sse(
+            queue,
+            event_type,
+            json!({
+                "type": event_type,
+                "sequence_number": self.next_seq(),
+                "response": self.response_object(status),
+            }),
+        );
+        self.response_completed = true;
+    }
+
+    pub(super) fn next_seq(&mut self) -> usize {
+        let seq = self.sequence_number;
+        self.sequence_number += 1;
+        seq
+    }
+
+    fn response_object(&self, status: &str) -> Value {
+        let mut response = json!({
+            "id": self.response_id,
+            "object": "response",
+            "model": self.model,
+            "created_at": self.created_at,
+            "status": status,
+            "output": self.completed_output,
+            "incomplete_details": null,
+        });
+        if let Some(usage) = &self.usage {
+            response["usage"] = usage.clone();
+        }
+        if status == "incomplete"
+            && let Some(details) = incomplete_details_for_stop_reason(self.stop_reason.as_deref())
+        {
+            response["incomplete_details"] = details;
+        }
+        response
+    }
+
+    fn merge_usage(&mut self, usage: Value) {
+        let Some(existing) = self.usage.as_mut() else {
+            self.usage = Some(usage);
+            return;
+        };
+        // Anthropic may report uncached input tokens in message_start, then
+        // report only cache components (with input_tokens = 0) in
+        // message_delta. Preserve and merge those components independently;
+        // replacing the aggregate would discard the start-frame input usage.
+        let existing_uncached = uncached_input_tokens(existing);
+        let incoming_uncached = uncached_input_tokens(&usage);
+        merge_i64_field(existing, &usage, "output_tokens");
+        merge_input_detail(existing, &usage, "cached_tokens");
+        merge_input_detail(existing, &usage, "cache_creation_tokens");
+        merge_input_detail(existing, &usage, "cache_creation_5m_tokens");
+        merge_input_detail(existing, &usage, "cache_creation_1h_tokens");
+        merge_output_detail(existing, &usage, "reasoning_tokens");
+
+        let uncached = if incoming_uncached != 0 || existing_uncached == 0 {
+            incoming_uncached
+        } else {
+            existing_uncached
+        };
+        let input = uncached
+            + input_detail(existing, "cached_tokens")
+            + input_detail(existing, "cache_creation_tokens");
+        let output = existing
+            .get("output_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        existing["input_tokens"] = json!(input);
+        existing["total_tokens"] = json!(input + output);
+    }
+}
+
+fn uncached_input_tokens(usage: &Value) -> i64 {
+    usage
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .saturating_sub(input_detail(usage, "cached_tokens"))
+        .saturating_sub(input_detail(usage, "cache_creation_tokens"))
+}
+
+fn input_detail(usage: &Value, field: &str) -> i64 {
+    usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get(field))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+fn merge_input_detail(existing: &mut Value, usage: &Value, field: &str) {
+    let Some(value) = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get(field))
+        .and_then(Value::as_i64)
+    else {
+        return;
+    };
+    let current = existing
+        .get("input_tokens_details")
+        .and_then(|details| details.get(field))
+        .and_then(Value::as_i64);
+    if value != 0 || current.is_none() {
+        existing["input_tokens_details"][field] = json!(value);
+    }
+}
+
+fn merge_output_detail(existing: &mut Value, usage: &Value, field: &str) {
+    let Some(value) = usage
+        .get("output_tokens_details")
+        .and_then(|details| details.get(field))
+        .and_then(Value::as_i64)
+    else {
+        return;
+    };
+    let current = existing
+        .get("output_tokens_details")
+        .and_then(|details| details.get(field))
+        .and_then(Value::as_i64);
+    if value != 0 || current.is_none() {
+        existing["output_tokens_details"][field] = json!(value);
+    }
+}

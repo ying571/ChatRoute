@@ -1,0 +1,3542 @@
+use super::options::{AnthropicProviderOptions, AnthropicProviderProfile};
+use super::request::{build_anthropic_request, build_anthropic_request_with_scope};
+use super::response::convert_anthropic_response;
+use super::stream::AnthropicSseToResponsesSse;
+use super::stream_internal::InternalSseEnvelope;
+use super::types::{ANTHROPIC_CLAUDE_CODE_BETA, ANTHROPIC_WEB_SEARCH_TYPE, CLAUDE_CODE_USER_AGENT};
+use super::{
+    anthropic_message_from_sse, append_tool_results, bearer_authorization,
+    build_anthropic_upstream_request, find_web_search_tool_uses, insert_metadata_user_id,
+    internal_web_search_body, merge_anthropic_betas, raw_sse_has_first_content_token,
+    scope_anthropic_response, search_results_to_tool_text,
+};
+use crate::ai_gateway::config::{ProviderConfig, ProviderType};
+use crate::ai_gateway::context::GatewayContext;
+use crate::ai_gateway::encrypted_content::{AnthropicEncryptedContentKind, EncryptedContentScope};
+use crate::ai_gateway::model::{
+    ContentPart, FunctionCallOutput, FunctionCallOutputContentItem, GatewayRequest, ItemContent,
+    ItemType, Reasoning, ResponseItem, SummaryPart,
+};
+use crate::ai_gateway::responses_compat::ResponsesCompatSseStream;
+use crate::ai_gateway::tool_names::ToolNameMap;
+use axum::{
+    body::Bytes,
+    http::{HeaderMap, HeaderValue},
+};
+use futures_util::{StreamExt, stream};
+use serde_json::{Value, json};
+use std::time::Instant;
+
+use crate::ai_gateway::request_log::{
+    LogUsage, RequestLogContext, RequestLogRecord, RequestLogStore, ResponsesSseLogStream,
+};
+
+fn convert_response(response: &Value) -> crate::ai_gateway::model::ResponseObject {
+    convert_anthropic_response(
+        response,
+        "fallback-model",
+        &ToolNameMap::default(),
+        AnthropicProviderProfile::Anthropic,
+    )
+}
+
+fn convert_glm_response(response: &Value) -> crate::ai_gateway::model::ResponseObject {
+    convert_anthropic_response(
+        response,
+        "fallback-model",
+        &ToolNameMap::default(),
+        AnthropicProviderProfile::GlmAnthropic,
+    )
+}
+
+fn response_stream<S>(input: S, model: &str, map: ToolNameMap) -> AnthropicSseToResponsesSse<S> {
+    AnthropicSseToResponsesSse::new(
+        input,
+        model.to_string(),
+        map,
+        AnthropicProviderProfile::Anthropic,
+    )
+}
+
+fn glm_response_stream<S>(
+    input: S,
+    model: &str,
+    map: ToolNameMap,
+) -> AnthropicSseToResponsesSse<S> {
+    AnthropicSseToResponsesSse::new(
+        input,
+        model.to_string(),
+        map,
+        AnthropicProviderProfile::GlmAnthropic,
+    )
+}
+
+fn request(input: Vec<ResponseItem>) -> GatewayRequest {
+    GatewayRequest {
+        model: "claude-sonnet-4-6".to_string(),
+        instructions: Some("Be precise.".to_string()),
+        input,
+        tools: Vec::new(),
+        tool_choice: None,
+        reasoning: None,
+        text: None,
+        stream: false,
+        max_output_tokens: Some(1234),
+        temperature: Some(0.2),
+        top_p: None,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+        previous_response_id: None,
+    }
+}
+
+fn provider(api_key: &str, compatibility: Option<&str>) -> ProviderConfig {
+    ProviderConfig {
+        name: "claude".to_string(),
+        provider_type: ProviderType::AnthropicMessages,
+        compatibility: compatibility.map(ToOwned::to_owned),
+        base_url: "https://api.anthropic.com/v1".to_string(),
+        api_key: api_key.to_string(),
+        ..Default::default()
+    }
+}
+
+fn encrypted_content_scope(
+    name: &str,
+    provider_type: ProviderType,
+    base_url: &str,
+) -> EncryptedContentScope {
+    EncryptedContentScope::for_provider(&ProviderConfig {
+        name: name.to_string(),
+        provider_type,
+        base_url: base_url.to_string(),
+        ..ProviderConfig::default()
+    })
+}
+
+fn reasoning_item(summary: Option<&str>, encrypted_content: String) -> ResponseItem {
+    let mut item = message("assistant", "ignored");
+    item.item_type = ItemType::Reasoning;
+    item.role = None;
+    item.content = None;
+    item.summary = summary.map(|text| {
+        vec![SummaryPart {
+            part_type: "summary_text".to_string(),
+            text: text.to_string(),
+        }]
+    });
+    item.encrypted_content = Some(encrypted_content);
+    item
+}
+
+fn message(role: &str, text: &str) -> ResponseItem {
+    ResponseItem {
+        item_type: ItemType::Message,
+        id: None,
+        role: Some(role.to_string()),
+        content: Some(ItemContent::Parts(vec![ContentPart {
+            part_type: if role == "assistant" {
+                "output_text".to_string()
+            } else {
+                "input_text".to_string()
+            },
+            text: Some(text.to_string()),
+            image_url: None,
+            detail: None,
+            annotations: None,
+        }])),
+        text: None,
+        name: None,
+        namespace: None,
+        call_id: None,
+        arguments: None,
+        input: None,
+        output: None,
+        status: None,
+        execution: None,
+        tools: None,
+        image_url: None,
+        detail: None,
+        action: None,
+        summary: None,
+        encrypted_content: None,
+    }
+}
+
+fn parse_events_from_bytes(chunks: &[Bytes]) -> Vec<(String, Value)> {
+    let mut events = Vec::new();
+    for chunk in chunks {
+        let text = String::from_utf8_lossy(chunk);
+        let mut event_type = String::new();
+        let mut data = String::new();
+        for line in text.lines() {
+            if let Some(event) = line.strip_prefix("event: ") {
+                event_type = event.to_string();
+            } else if let Some(value) = line.strip_prefix("data: ") {
+                data = value.to_string();
+            }
+        }
+        if !event_type.is_empty() && !data.is_empty() {
+            events.push((event_type, serde_json::from_str(&data).unwrap()));
+        }
+    }
+    events
+}
+
+#[test]
+fn bearer_authorization_normalizes_values() {
+    assert_eq!(
+        bearer_authorization("Bearer access-token"),
+        "Bearer access-token"
+    );
+    assert_eq!(
+        bearer_authorization("sk-ant-api03-example"),
+        "Bearer sk-ant-api03-example"
+    );
+    assert_eq!(bearer_authorization("proxy-key"), "Bearer proxy-key");
+}
+
+#[test]
+fn merge_anthropic_betas_preserves_required_and_extra_flags() {
+    let merged = merge_anthropic_betas(
+        "claude-code-20250219,interleaved-thinking-2025-05-14",
+        "extra-beta,claude-code-20250219",
+    );
+
+    assert_eq!(
+        merged,
+        "claude-code-20250219,interleaved-thinking-2025-05-14,extra-beta"
+    );
+}
+
+#[test]
+fn builds_claude_code_aligned_headers_for_anthropic_profile() {
+    let client = reqwest::Client::new();
+    let mut inbound_headers = HeaderMap::new();
+    inbound_headers.insert("session_id", HeaderValue::from_static("session-123"));
+    inbound_headers.insert("thread-id", HeaderValue::from_static("thread-123"));
+    inbound_headers.insert("origin", HeaderValue::from_static("https://codex.local"));
+    inbound_headers.insert("user-agent", HeaderValue::from_static("Codex/1.0"));
+    inbound_headers.insert("accept", HeaderValue::from_static("application/json"));
+    inbound_headers.insert(
+        "anthropic-beta",
+        HeaderValue::from_static("custom-beta,claude-code-20250219"),
+    );
+    let ctx = GatewayContext::extract(&inbound_headers, None);
+    let mut req = request(vec![message("user", "hello")]);
+    req.stream = true;
+    let body = json!({"model":"claude-opus-4-8","messages":[],"stream":true});
+    let provider = provider("Bearer oauth-token", Some("anthropic"));
+    let options = AnthropicProviderOptions::from_provider(&provider).unwrap();
+
+    let upstream =
+        build_anthropic_upstream_request(&client, &ctx, &req, &body, &provider, &options).unwrap();
+    let headers = upstream.headers();
+
+    assert_eq!(upstream.version(), reqwest::Version::HTTP_11);
+    assert_eq!(headers.get("authorization").unwrap(), "Bearer oauth-token");
+    assert!(headers.get("x-api-key").is_none());
+    assert_eq!(headers.get("content-type").unwrap(), "application/json");
+    assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+    assert_eq!(headers.get("x-app").unwrap(), "cli");
+    assert_eq!(headers.get("user-agent").unwrap(), CLAUDE_CODE_USER_AGENT);
+    assert_eq!(headers.get("accept").unwrap(), "application/json");
+    assert_eq!(
+        headers.get("accept-encoding").unwrap(),
+        "gzip, deflate, br, zstd"
+    );
+    assert_eq!(headers.get("connection").unwrap(), "keep-alive");
+    assert_eq!(headers.get("x-stainless-runtime").unwrap(), "node");
+    assert_eq!(headers.get("x-stainless-lang").unwrap(), "js");
+    assert_eq!(headers.get("x-stainless-timeout").unwrap(), "600");
+    assert_eq!(headers.get("x-stainless-retry-count").unwrap(), "0");
+    assert_eq!(
+        headers.get("x-claude-code-session-id").unwrap(),
+        "session-123"
+    );
+    assert_eq!(
+        headers
+            .get("anthropic-dangerous-direct-browser-access")
+            .unwrap(),
+        "true"
+    );
+    let beta = headers.get("anthropic-beta").unwrap().to_str().unwrap();
+    assert_eq!(beta, ANTHROPIC_CLAUDE_CODE_BETA);
+    assert_eq!(
+        headers.get_all("user-agent").iter().count(),
+        1,
+        "managed Claude Code headers must replace passthrough values instead of appending"
+    );
+    assert!(headers.get("session-id").is_none());
+    assert!(headers.get("thread-id").is_none());
+    assert!(headers.get("origin").is_none());
+    assert!(headers.get("x-client-request-id").is_none());
+}
+
+#[test]
+fn anthropic_profile_uses_claude_code_headers_for_regular_api_keys() {
+    let client = reqwest::Client::new();
+    let ctx = GatewayContext::extract(&HeaderMap::new(), Some("cache-key"));
+    let req = request(vec![message("user", "hello")]);
+    let body = json!({"model":"claude-opus-4-8","messages":[]});
+    let provider = provider("sk-ant-api03-example", Some("anthropic"));
+    let options = AnthropicProviderOptions::from_provider(&provider).unwrap();
+
+    let upstream =
+        build_anthropic_upstream_request(&client, &ctx, &req, &body, &provider, &options).unwrap();
+    let headers = upstream.headers();
+
+    assert_eq!(
+        headers.get("authorization").unwrap(),
+        "Bearer sk-ant-api03-example"
+    );
+    assert!(headers.get("x-api-key").is_none());
+    assert_eq!(
+        headers.get("anthropic-beta").unwrap(),
+        ANTHROPIC_CLAUDE_CODE_BETA
+    );
+    assert_eq!(headers.get("x-app").unwrap(), "cli");
+    assert_eq!(headers.get("x-stainless-runtime").unwrap(), "node");
+    assert_eq!(
+        headers.get("x-claude-code-session-id").unwrap(),
+        "cache-key"
+    );
+}
+
+#[test]
+fn glm_profile_also_uses_claude_code_headers() {
+    let client = reqwest::Client::new();
+    let mut inbound_headers = HeaderMap::new();
+    inbound_headers.insert("user-agent", HeaderValue::from_static("Codex/1.0"));
+    let ctx = GatewayContext::extract(&inbound_headers, None);
+    let req = request(vec![message("user", "hello")]);
+    let body = json!({"model":"glm-5.3","messages":[]});
+    let provider = provider("glm-key", Some("glm_anthropic"));
+    let options = AnthropicProviderOptions::from_provider(&provider).unwrap();
+
+    let upstream =
+        build_anthropic_upstream_request(&client, &ctx, &req, &body, &provider, &options).unwrap();
+    let headers = upstream.headers();
+
+    assert_eq!(headers.get("authorization").unwrap(), "Bearer glm-key");
+    assert!(headers.get("x-api-key").is_none());
+    assert_eq!(headers.get("user-agent").unwrap(), CLAUDE_CODE_USER_AGENT);
+    assert_eq!(
+        headers.get("anthropic-beta").unwrap(),
+        ANTHROPIC_CLAUDE_CODE_BETA
+    );
+    assert_eq!(headers.get("x-app").unwrap(), "cli");
+    assert!(headers.get("session-id").is_none());
+    assert!(headers.get("thread-id").is_none());
+}
+
+#[test]
+fn builds_anthropic_text_request() {
+    let (body, _) = build_anthropic_request(
+        &request(vec![
+            message("user", "hello"),
+            message("assistant", "hi"),
+            message("user", "continue"),
+        ]),
+        AnthropicProviderProfile::Anthropic,
+    )
+    .unwrap();
+
+    assert_eq!(body["model"], "claude-sonnet-4-6");
+    assert_eq!(body["max_tokens"], 1234);
+    assert_eq!(body["system"][0]["type"], "text");
+    assert_eq!(body["system"][0]["text"], "Be precise.");
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(body["temperature"], 0.2);
+    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+    assert_eq!(body["messages"][1]["role"], "assistant");
+    assert_eq!(body["messages"][1]["content"][0]["text"], "hi");
+    // Single rolling breakpoint: only the last message (msg[2]) is marked.
+    assert_eq!(
+        body["messages"][2]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert!(
+        body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none()
+    );
+    assert!(
+        body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none()
+    );
+    assert!(body.get("cache_control").is_none());
+}
+
+#[test]
+fn replays_matching_anthropic_thinking_with_text_and_tool_use() {
+    let scope = encrypted_content_scope(
+        "claude",
+        ProviderType::AnthropicMessages,
+        "https://api.anthropic.com/v1",
+    );
+    let reasoning = reasoning_item(
+        Some("I should inspect the repository."),
+        scope.encode_anthropic(AnthropicEncryptedContentKind::Thinking, "sig_123"),
+    );
+    let mut tool_call = message("assistant", "ignored");
+    tool_call.item_type = ItemType::FunctionCall;
+    tool_call.content = None;
+    tool_call.name = Some("read_file".to_string());
+    tool_call.call_id = Some("toolu_123".to_string());
+    tool_call.arguments = Some(crate::ai_gateway::model::JsonString::Value(json!({
+        "path": "README.md"
+    })));
+
+    let (body, _) = build_anthropic_request_with_scope(
+        &request(vec![
+            message("user", "inspect it"),
+            reasoning,
+            message("assistant", "I will inspect it."),
+            tool_call,
+        ]),
+        AnthropicProviderProfile::Anthropic,
+        &scope,
+    )
+    .unwrap();
+
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1]["role"], "assistant");
+    let content = messages[1]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "I should inspect the repository.");
+    assert_eq!(content[0]["signature"], "sig_123");
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[2]["type"], "tool_use");
+}
+
+#[test]
+fn replays_matching_anthropic_redacted_thinking() {
+    let scope = encrypted_content_scope(
+        "claude",
+        ProviderType::AnthropicMessages,
+        "https://api.anthropic.com/v1",
+    );
+    let reasoning = reasoning_item(
+        None,
+        scope.encode_anthropic(
+            AnthropicEncryptedContentKind::RedactedThinking,
+            "encrypted_456",
+        ),
+    );
+
+    let (body, _) = build_anthropic_request_with_scope(
+        &request(vec![
+            message("user", "continue"),
+            reasoning,
+            message("assistant", "final"),
+        ]),
+        AnthropicProviderProfile::Anthropic,
+        &scope,
+    )
+    .unwrap();
+
+    let content = body["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "redacted_thinking");
+    assert_eq!(content[0]["data"], "encrypted_456");
+    assert_eq!(content[1]["type"], "text");
+}
+
+#[test]
+fn replays_omitted_anthropic_thinking_as_thinking_not_redacted() {
+    let scope = encrypted_content_scope(
+        "claude",
+        ProviderType::AnthropicMessages,
+        "https://api.anthropic.com/v1",
+    );
+    let mut reasoning = reasoning_item(
+        None,
+        scope.encode_anthropic(AnthropicEncryptedContentKind::Thinking, "sig_omitted"),
+    );
+    reasoning.summary = Some(Vec::new());
+
+    let (body, _) = build_anthropic_request_with_scope(
+        &request(vec![
+            message("user", "continue"),
+            reasoning,
+            message("assistant", "final"),
+        ]),
+        AnthropicProviderProfile::Anthropic,
+        &scope,
+    )
+    .unwrap();
+
+    let content = body["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "");
+    assert_eq!(content[0]["signature"], "sig_omitted");
+}
+
+#[test]
+fn filters_foreign_and_unmarked_reasoning_from_anthropic_request() {
+    let anthropic_scope = encrypted_content_scope(
+        "claude",
+        ProviderType::AnthropicMessages,
+        "https://api.anthropic.com/v1",
+    );
+    let other_anthropic_scope = encrypted_content_scope(
+        "claude-backup",
+        ProviderType::AnthropicMessages,
+        "https://proxy.example.com/v1",
+    );
+    let grok_scope =
+        encrypted_content_scope("grok", ProviderType::GrokResponses, "https://api.x.ai/v1");
+
+    let (body, _) = build_anthropic_request_with_scope(
+        &request(vec![
+            message("user", "continue"),
+            reasoning_item(
+                Some("foreign Anthropic"),
+                other_anthropic_scope
+                    .encode_anthropic(AnthropicEncryptedContentKind::Thinking, "sig_a"),
+            ),
+            reasoning_item(Some("foreign Grok"), grok_scope.encode("sig_g")),
+            reasoning_item(Some("legacy"), "legacy-unmarked".to_string()),
+            message("assistant", "safe history"),
+        ]),
+        AnthropicProviderProfile::Anthropic,
+        &anthropic_scope,
+    )
+    .unwrap();
+
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    let assistant_content = messages[1]["content"].as_array().unwrap();
+    assert_eq!(assistant_content.len(), 1);
+    assert_eq!(assistant_content[0]["type"], "text");
+    let encoded = serde_json::to_string(&body).unwrap();
+    assert!(!encoded.contains("foreign Anthropic"));
+    assert!(!encoded.contains("foreign Grok"));
+    assert!(!encoded.contains("legacy-unmarked"));
+}
+
+#[test]
+fn builds_anthropic_request_with_claude_code_block_level_ephemeral_cache() {
+    let mut req = request(vec![message("user", "hello")]);
+    req.prompt_cache_retention = Some("1h".to_string());
+    req.tools = vec![json!({
+        "type": "function",
+        "name": "read_file",
+        "description": "Read a file",
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }
+    })];
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+
+    assert!(body.get("cache_control").is_none());
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert!(body["system"][0]["cache_control"].get("ttl").is_none());
+    assert!(body["tools"][0]["cache_control"].get("ttl").is_none());
+}
+
+#[test]
+fn marks_only_the_last_tool_cache_breakpoint() {
+    let mut req = request(vec![message("user", "use a tool")]);
+    req.tools = vec![
+        json!({
+            "type": "function",
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {"type": "object"}
+        }),
+        json!({
+            "type": "function",
+            "name": "write_file",
+            "description": "Write a file",
+            "parameters": {"type": "object"}
+        }),
+    ];
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+
+    assert!(body["tools"][0].get("cache_control").is_none());
+    assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+}
+
+#[test]
+fn caches_conversation_tail_only() {
+    let mut req = request(vec![
+        message("user", "start"),
+        message("assistant", "old answer"),
+        message("user", "continue"),
+        message("assistant", "latest answer"),
+        message("user", "next"),
+    ]);
+    req.instructions = None;
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+
+    assert!(body.get("system").is_none());
+    assert!(body.get("cache_control").is_none());
+    // Single rolling breakpoint on the conversation tail (idx 4), matching
+    // Claude Code. Earlier messages stay unmarked.
+    assert_eq!(
+        body["messages"][4]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    for idx in 0..4 {
+        assert!(
+            body["messages"][idx]["content"][0]
+                .get("cache_control")
+                .is_none(),
+            "message {idx} should not be marked"
+        );
+    }
+}
+
+#[test]
+fn caches_trailing_assistant_message() {
+    // The breakpoint follows the tail, so an assistant tail (e.g. a final text
+    // answer) carries it, mirroring Claude Code.
+    let mut req = request(vec![message("user", "run"), message("assistant", "answer")]);
+    req.instructions = None;
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+
+    assert_eq!(body["messages"][1]["role"], "assistant");
+    assert_eq!(
+        body["messages"][1]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert!(
+        body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none()
+    );
+}
+
+#[test]
+fn marks_last_text_block_of_tail_message() {
+    // A user message may carry an image/media block after its text; the
+    // breakpoint prefers the last text block, matching Claude Code's placement.
+    let mut multi = message("user", "ignored");
+    multi.content = Some(crate::ai_gateway::model::ItemContent::Parts(vec![
+        crate::ai_gateway::model::ContentPart {
+            part_type: "input_text".to_string(),
+            text: Some("look at this".to_string()),
+            image_url: None,
+            detail: None,
+            annotations: None,
+        },
+        crate::ai_gateway::model::ContentPart {
+            part_type: "input_image".to_string(),
+            text: None,
+            image_url: Some("data:image/png;base64,iVBORw0KGgo=".to_string()),
+            detail: None,
+            annotations: None,
+        },
+    ]));
+    let mut req = request(vec![multi]);
+    req.instructions = None;
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+
+    // Breakpoint sits on the text block (idx 0), not the trailing image (idx 1).
+    assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert!(
+        body["messages"][0]["content"][1]
+            .get("cache_control")
+            .is_none()
+    );
+}
+
+#[test]
+fn marks_last_block_when_tail_has_no_text() {
+    // A tool_use-only assistant tail (no text block) falls back to the last
+    // content block.
+    let mut tool_call = message("assistant", "ignored");
+    tool_call.item_type = ItemType::FunctionCall;
+    tool_call.content = None;
+    tool_call.name = Some("read_file".to_string());
+    tool_call.call_id = Some("toolu_123".to_string());
+    tool_call.arguments = Some(crate::ai_gateway::model::JsonString::Value(json!({
+        "path": "README.md"
+    })));
+    let mut req = request(vec![message("user", "run"), tool_call]);
+    req.instructions = None;
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+
+    assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+    assert_eq!(
+        body["messages"][1]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+}
+
+#[test]
+fn marks_exactly_one_message_breakpoint() {
+    let mut req = request(vec![
+        message("user", "first"),
+        message("assistant", "a1"),
+        message("user", "second"),
+    ]);
+    req.instructions = None;
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+
+    let marked = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| {
+            message["content"]
+                .as_array()
+                .and_then(|parts| {
+                    parts
+                        .iter()
+                        .find(|part| part.get("cache_control").is_some())
+                })
+                .is_some()
+        })
+        .count();
+    assert_eq!(marked, 1);
+}
+
+#[test]
+fn builds_anthropic_tool_result_message() {
+    let mut output = message("user", "ignored");
+    output.item_type = ItemType::FunctionCallOutput;
+    output.content = None;
+    output.call_id = Some("toolu_123".to_string());
+    output.output = Some(FunctionCallOutput::ContentItems(vec![
+        FunctionCallOutputContentItem {
+            item_type: "output_text".to_string(),
+            text: Some("done".to_string()),
+            image_url: None,
+            encrypted_content: None,
+            detail: None,
+        },
+    ]));
+
+    let (body, _) = build_anthropic_request(
+        &request(vec![message("user", "run"), output]),
+        AnthropicProviderProfile::Anthropic,
+    )
+    .unwrap();
+    assert_eq!(body["messages"][1]["role"], "user");
+    assert_eq!(body["messages"][1]["content"][0]["type"], "tool_result");
+    assert_eq!(
+        body["messages"][1]["content"][0]["tool_use_id"],
+        "toolu_123"
+    );
+    assert_eq!(body["messages"][1]["content"][0]["content"], "done");
+}
+
+#[test]
+fn groups_parallel_tool_uses_and_results_in_single_messages() {
+    let mut first_call = message("assistant", "ignored");
+    first_call.item_type = ItemType::FunctionCall;
+    first_call.content = None;
+    first_call.name = Some("exec_command".to_string());
+    first_call.call_id = Some("toolu_first".to_string());
+    first_call.arguments = Some(crate::ai_gateway::model::JsonString::Value(json!({
+        "cmd": "ls"
+    })));
+
+    let mut second_call = message("assistant", "ignored");
+    second_call.item_type = ItemType::FunctionCall;
+    second_call.content = None;
+    second_call.name = Some("exec_command".to_string());
+    second_call.call_id = Some("toolu_second".to_string());
+    second_call.arguments = Some(crate::ai_gateway::model::JsonString::Value(json!({
+        "cmd": "git status -s"
+    })));
+
+    let mut first_output = message("user", "ignored");
+    first_output.item_type = ItemType::FunctionCallOutput;
+    first_output.content = None;
+    first_output.call_id = Some("toolu_first".to_string());
+    first_output.output = Some(FunctionCallOutput::Text("first done".to_string()));
+
+    let mut second_output = message("user", "ignored");
+    second_output.item_type = ItemType::FunctionCallOutput;
+    second_output.content = None;
+    second_output.call_id = Some("toolu_second".to_string());
+    second_output.output = Some(FunctionCallOutput::Text("second done".to_string()));
+
+    let mut duplicate_second_output = message("user", "ignored");
+    duplicate_second_output.item_type = ItemType::FunctionCallOutput;
+    duplicate_second_output.content = None;
+    duplicate_second_output.call_id = Some("toolu_second".to_string());
+    duplicate_second_output.output = Some(FunctionCallOutput::Text("second follow-up".to_string()));
+
+    let (body, _) = build_anthropic_request(
+        &request(vec![
+            message("user", "run tools"),
+            first_call,
+            second_call,
+            first_output,
+            second_output,
+            duplicate_second_output,
+        ]),
+        AnthropicProviderProfile::Anthropic,
+    )
+    .unwrap();
+
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(body["messages"][1]["role"], "assistant");
+    assert_eq!(body["messages"][1]["content"].as_array().unwrap().len(), 2);
+    assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+    assert_eq!(body["messages"][1]["content"][0]["id"], "toolu_first");
+    assert_eq!(body["messages"][1]["content"][1]["type"], "tool_use");
+    assert_eq!(body["messages"][1]["content"][1]["id"], "toolu_second");
+
+    assert_eq!(body["messages"][2]["role"], "user");
+    assert_eq!(body["messages"][2]["content"].as_array().unwrap().len(), 2);
+    assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+    assert_eq!(
+        body["messages"][2]["content"][0]["tool_use_id"],
+        "toolu_first"
+    );
+    assert_eq!(body["messages"][2]["content"][1]["type"], "tool_result");
+    assert_eq!(
+        body["messages"][2]["content"][1]["tool_use_id"],
+        "toolu_second"
+    );
+    assert_eq!(
+        body["messages"][2]["content"][1]["content"],
+        "second done\n\nsecond follow-up"
+    );
+}
+
+#[test]
+fn lifts_anthropic_tool_result_images_into_user_content() {
+    let image_url = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD";
+    let output = image_tool_result("toolu_image", image_url);
+
+    let (body, _) = build_anthropic_request(
+        &request(vec![message("user", "run"), output]),
+        AnthropicProviderProfile::Anthropic,
+    )
+    .unwrap();
+
+    assert_anthropic_lifted_tool_result_image(&body);
+}
+
+#[test]
+fn lifts_glm_tool_result_images_into_user_content() {
+    let image_url = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD";
+    let output = image_tool_result("toolu_image", image_url);
+
+    let (body, _) = build_anthropic_request(
+        &request(vec![message("user", "run"), output]),
+        AnthropicProviderProfile::GlmAnthropic,
+    )
+    .unwrap();
+
+    assert_anthropic_lifted_tool_result_image(&body);
+}
+
+fn image_tool_result(call_id: &str, image_url: &str) -> ResponseItem {
+    let mut output = message("user", "ignored");
+    output.item_type = ItemType::FunctionCallOutput;
+    output.content = None;
+    output.call_id = Some(call_id.to_string());
+    output.output = Some(FunctionCallOutput::ContentItems(vec![
+        FunctionCallOutputContentItem {
+            item_type: "input_text".to_string(),
+            text: Some("Wall time: 0.0060 seconds\nOutput:".to_string()),
+            image_url: None,
+            encrypted_content: None,
+            detail: None,
+        },
+        FunctionCallOutputContentItem {
+            item_type: "input_text".to_string(),
+            text: Some("有的！这是B站搜索结果的截图：".to_string()),
+            image_url: None,
+            encrypted_content: None,
+            detail: None,
+        },
+        FunctionCallOutputContentItem {
+            item_type: "input_image".to_string(),
+            text: None,
+            image_url: Some(image_url.to_string()),
+            encrypted_content: None,
+            detail: Some(json!("original")),
+        },
+    ]));
+    output
+}
+
+fn assert_anthropic_lifted_tool_result_image(body: &Value) {
+    let message_content = body["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(message_content.len(), 2);
+    assert_eq!(message_content[0]["type"], "tool_result");
+    let tool_content = message_content[0]["content"].as_array().unwrap();
+    assert_eq!(tool_content[0]["type"], "text");
+    assert_eq!(
+        tool_content[0]["text"],
+        "Wall time: 0.0060 seconds\nOutput:"
+    );
+    assert_eq!(tool_content[1]["type"], "text");
+    assert_eq!(tool_content[1]["text"], "有的！这是B站搜索结果的截图：");
+    assert_eq!(message_content[1]["type"], "image");
+    assert_eq!(message_content[1]["source"]["type"], "base64");
+    assert_eq!(message_content[1]["source"]["media_type"], "image/jpeg");
+    assert_eq!(
+        message_content[1]["source"]["data"],
+        "/9j/4AAQSkZJRgABAQAAAQABAAD"
+    );
+    assert_eq!(message_content[1]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
+fn image_only_tool_result_uses_placeholder_and_lifted_image() {
+    let mut output = image_tool_result("toolu_image_only", "data:image/png;base64,iVBORw0KGgo=");
+    output.output = Some(FunctionCallOutput::ContentItems(vec![
+        FunctionCallOutputContentItem {
+            item_type: "input_image".to_string(),
+            text: None,
+            image_url: Some("data:image/png;base64,iVBORw0KGgo=".to_string()),
+            encrypted_content: None,
+            detail: Some(json!("original")),
+        },
+    ]));
+
+    let (body, _) = build_anthropic_request(
+        &request(vec![message("user", "inspect"), output]),
+        AnthropicProviderProfile::Anthropic,
+    )
+    .unwrap();
+
+    let content = body["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "tool_result");
+    assert_eq!(content[0]["content"], "Image output attached below.");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], "iVBORw0KGgo=");
+}
+
+#[test]
+fn parses_current_codex_view_image_output_and_lifts_image() {
+    let request: GatewayRequest = serde_json::from_value(json!({
+        "model": "claude-opus-4-8",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect the image"}]
+            },
+            {
+                "type": "function_call",
+                "name": "view_image",
+                "arguments": "{\"path\":\"C:/tmp/example.png\"}",
+                "call_id": "view-image-call"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "view-image-call",
+                "output": [{
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,aW1hZ2U=",
+                    "detail": "original"
+                }]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let (body, _) = build_anthropic_request(&request, AnthropicProviderProfile::Anthropic).unwrap();
+
+    assert_eq!(body["messages"][1]["role"], "assistant");
+    assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+    assert_eq!(body["messages"][1]["content"][0]["name"], "view_image");
+    let content = body["messages"][2]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "tool_result");
+    assert_eq!(content[0]["tool_use_id"], "view-image-call");
+    assert_eq!(content[0]["content"], "Image output attached below.");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    assert_eq!(content[1]["source"]["data"], "aW1hZ2U=");
+}
+
+#[test]
+fn parallel_image_tool_results_keep_results_before_images() {
+    let first = image_tool_result("toolu_first_image", "data:image/png;base64,Zmlyc3Q=");
+    let second = image_tool_result("toolu_second_image", "data:image/jpeg;base64,c2Vjb25k");
+
+    let (body, _) = build_anthropic_request(
+        &request(vec![message("user", "inspect"), first, second]),
+        AnthropicProviderProfile::Anthropic,
+    )
+    .unwrap();
+
+    let content = body["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 4);
+    assert_eq!(content[0]["type"], "tool_result");
+    assert_eq!(content[0]["tool_use_id"], "toolu_first_image");
+    assert_eq!(content[1]["type"], "tool_result");
+    assert_eq!(content[1]["tool_use_id"], "toolu_second_image");
+    assert_eq!(content[2]["type"], "image");
+    assert_eq!(content[2]["source"]["data"], "Zmlyc3Q=");
+    assert_eq!(content[3]["type"], "image");
+    assert_eq!(content[3]["source"]["data"], "c2Vjb25k");
+}
+
+#[test]
+fn builds_anthropic_tool_search_result_message_and_loaded_tools() {
+    let mut search = message("assistant", "ignored");
+    search.item_type = ItemType::ToolSearchCall;
+    search.content = None;
+    search.call_id = Some("tooluse_search_1".to_string());
+    search.execution = Some("client".to_string());
+    search.arguments = Some(crate::ai_gateway::model::JsonString::Value(json!({
+        "query": "web search browse internet news sports"
+    })));
+
+    let mut output = message("user", "ignored");
+    output.item_type = ItemType::ToolSearchOutput;
+    output.content = None;
+    output.call_id = Some("tooluse_search_1".to_string());
+    output.execution = Some("client".to_string());
+    output.status = Some("completed".to_string());
+    output.tools = Some(vec![json!({
+        "description": "Tools provided by the Codex app.",
+        "name": "codex_app",
+        "tools": [{
+            "defer_loading": true,
+            "description": "List recent Codex threads across the local host and connected remote hosts.",
+            "name": "list_threads",
+            "parameters": {
+                "additionalProperties": false,
+                "properties": {
+                    "limit": {"type": "number"},
+                    "query": {"type": "string"}
+                },
+                "type": "object"
+            },
+            "strict": false,
+            "type": "function"
+        }],
+        "type": "namespace"
+    })]);
+
+    let (body, map) = build_anthropic_request(
+        &request(vec![
+            message("user", "today world cup results"),
+            search,
+            output,
+        ]),
+        AnthropicProviderProfile::Anthropic,
+    )
+    .unwrap();
+
+    assert_eq!(body["messages"][1]["role"], "assistant");
+    assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+    assert_eq!(body["messages"][1]["content"][0]["id"], "tooluse_search_1");
+    assert_eq!(body["messages"][1]["content"][0]["name"], "tool_search");
+    assert_eq!(
+        body["messages"][1]["content"][0]["input"]["query"],
+        "web search browse internet news sports"
+    );
+    assert_eq!(body["messages"][2]["role"], "user");
+    assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+    assert_eq!(
+        body["messages"][2]["content"][0]["tool_use_id"],
+        "tooluse_search_1"
+    );
+    let result: Value = serde_json::from_str(
+        body["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["execution"], "client");
+    assert_eq!(result["tools"][0]["name"], "codex_app");
+
+    assert_eq!(body["tools"][0]["name"], "codex_app__codexns__list_threads");
+    let decoded = map.decode("codex_app__codexns__list_threads");
+    assert_eq!(decoded.namespace.as_deref(), Some("codex_app"));
+    assert_eq!(decoded.name, "list_threads");
+}
+
+#[test]
+fn replays_responses_web_search_call_history_as_websearch_tool_use() {
+    let assistant = message("assistant", "我来搜索一下。");
+    let mut search = message("assistant", "ignored");
+    search.item_type = ItemType::WebSearchCall;
+    search.content = None;
+    search.status = Some("completed".to_string());
+    search.action = Some(json!({
+        "type": "search",
+        "query": "latest rust news",
+        "queries": ["latest rust news", "rust 2026"]
+    }));
+
+    let (body, _) = build_anthropic_request(
+        &request(vec![message("user", "search rust"), assistant, search]),
+        AnthropicProviderProfile::Anthropic,
+    )
+    .unwrap();
+
+    assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(body["messages"][1]["role"], "assistant");
+    assert_eq!(body["messages"][1]["content"][0]["type"], "text");
+    assert_eq!(body["messages"][1]["content"][0]["text"], "我来搜索一下。");
+    assert_eq!(body["messages"][1]["content"][1]["type"], "tool_use");
+    assert_eq!(body["messages"][1]["content"][1]["name"], "WebSearch");
+    assert_eq!(
+        body["messages"][1]["content"][1]["input"]["query"],
+        "latest rust news"
+    );
+    assert_eq!(body["messages"][1]["content"][2]["type"], "tool_use");
+    assert_eq!(body["messages"][1]["content"][2]["name"], "WebSearch");
+    assert_eq!(
+        body["messages"][1]["content"][2]["input"]["query"],
+        "rust 2026"
+    );
+
+    let first_id = body["messages"][1]["content"][1]["id"].as_str().unwrap();
+    let second_id = body["messages"][1]["content"][2]["id"].as_str().unwrap();
+    assert!(first_id.starts_with("tooluse_ws_2_0_"));
+    assert!(second_id.starts_with("tooluse_ws_2_1_"));
+    assert_ne!(first_id, second_id);
+
+    assert_eq!(body["messages"][2]["role"], "user");
+    assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+    assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], first_id);
+    assert!(
+        body["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("latest rust news")
+    );
+    assert_eq!(body["messages"][2]["content"][1]["type"], "tool_result");
+    assert_eq!(body["messages"][2]["content"][1]["tool_use_id"], second_id);
+    assert!(
+        body["messages"][2]["content"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("rust 2026")
+    );
+}
+
+#[test]
+fn rejects_invalid_anthropic_tool_use_ids_before_upstream() {
+    let mut tool_call = message("assistant", "ignored");
+    tool_call.item_type = ItemType::FunctionCall;
+    tool_call.content = None;
+    tool_call.name = Some("exec_command".to_string());
+    tool_call.call_id = Some("bad id".to_string());
+    tool_call.arguments = Some(crate::ai_gateway::model::JsonString::Value(json!({
+        "cmd": "echo hi"
+    })));
+
+    let err = build_anthropic_request(
+        &request(vec![message("user", "run"), tool_call]),
+        AnthropicProviderProfile::Anthropic,
+    )
+    .unwrap_err();
+    assert!(err.message.contains("tool_use id"));
+}
+
+#[test]
+fn builds_anthropic_tools_and_tool_choice() {
+    let mut req = request(vec![message("user", "search docs")]);
+    req.tools = vec![json!({
+        "type": "namespace",
+        "name": "browser",
+        "tools": [{
+            "type": "function",
+            "name": "open page",
+            "description": "Open a URL",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            }
+        }]
+    })];
+    req.tool_choice = Some(json!({
+        "type": "function",
+        "namespace": "browser",
+        "name": "open page"
+    }));
+
+    let (body, map) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+    assert_eq!(body["tools"][0]["name"], "browser__codexns__open_page");
+    assert_eq!(body["tools"][0]["description"], "Open a URL");
+    assert_eq!(
+        body["tools"][0]["input_schema"]["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+    assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    assert_eq!(body["tools"][0]["input_schema"]["required"][0], "url");
+    assert_eq!(
+        body["tools"][0]["input_schema"]["additionalProperties"],
+        false
+    );
+    assert_eq!(body["tool_choice"]["type"], "tool");
+    assert_eq!(body["tool_choice"]["name"], "browser__codexns__open_page");
+
+    let target = map.decode("browser__codexns__open_page");
+    assert_eq!(target.namespace.as_deref(), Some("browser"));
+    assert_eq!(target.name, "open page");
+}
+
+#[test]
+fn preserves_native_anthropic_client_tool_shape() {
+    let mut req = request(vec![message("user", "search docs")]);
+    req.tools = vec![json!({
+        "name": "WebSearch",
+        "description": "Search the web.",
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+        "input_schema": {
+            "type": "object",
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "minLength": 2}
+            },
+            "additionalProperties": false
+        }
+    })];
+    req.tool_choice = Some(json!({
+        "type": "tool",
+        "name": "WebSearch"
+    }));
+
+    let (body, map) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+    assert_eq!(body["tools"][0]["name"], "WebSearch");
+    assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+    assert!(body["tools"][0]["cache_control"].get("ttl").is_none());
+    assert_eq!(
+        body["tools"][0]["input_schema"]["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+    assert_eq!(body["tool_choice"]["type"], "tool");
+    assert_eq!(body["tool_choice"]["name"], "WebSearch");
+
+    let target = map.decode("WebSearch");
+    assert_eq!(target.namespace, None);
+    assert_eq!(target.name, "WebSearch");
+}
+
+#[test]
+fn builds_claude_code_style_input_schema_for_tools_without_parameters() {
+    let mut req = request(vec![message("user", "list cron jobs")]);
+    req.tools = vec![json!({
+        "type": "function",
+        "name": "cron_list",
+        "description": "List all cron jobs."
+    })];
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+    let schema = &body["tools"][0]["input_schema"];
+
+    assert_eq!(body["tools"][0]["name"], "cron_list");
+    assert_eq!(schema["type"], "object");
+    assert_eq!(
+        schema["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+    assert_eq!(schema["properties"], json!({}));
+    assert_eq!(schema["additionalProperties"], false);
+    assert!(schema.get("required").is_none());
+}
+
+#[test]
+fn builds_anthropic_apply_patch_custom_tool() {
+    let mut req = request(vec![message("user", "edit a file")]);
+    req.tools = vec![json!({
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap the patch in JSON.",
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?"
+        }
+    })];
+    req.tool_choice = Some(json!({
+        "type": "custom",
+        "name": "apply_patch"
+    }));
+
+    let (body, map) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+    assert_eq!(body["tools"][0]["name"], "apply_patch");
+    assert_eq!(
+        body["tools"][0]["input_schema"]["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+    assert_eq!(
+        body["tools"][0]["input_schema"]["additionalProperties"],
+        false
+    );
+    assert_eq!(body["tools"][0]["input_schema"]["required"][0], "input");
+    assert_eq!(
+        body["tools"][0]["input_schema"]["properties"]["input"]["description"],
+        "The entire apply_patch patch body."
+    );
+    assert!(
+        body["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Call this tool with JSON arguments matching")
+    );
+    assert!(
+        body["tools"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("final non-whitespace line must be exactly `*** End Patch`")
+    );
+    let description = body["tools"][0]["description"].as_str().unwrap();
+    assert!(description.contains("Few-shot examples:"));
+    assert!(description.contains("*** Add File: notes.md\n+# Notes\n+"));
+    assert!(description.contains("*** Update File: src/example.txt"));
+    assert!(description.contains("*** Delete File: old.txt"));
+    assert_eq!(body["tool_choice"]["type"], "tool");
+    assert_eq!(body["tool_choice"]["name"], "apply_patch");
+
+    let target = map.decode("apply_patch");
+    assert_eq!(
+        target.kind,
+        crate::ai_gateway::tool_names::ToolCallKind::Custom
+    );
+    assert_eq!(target.name, "apply_patch");
+}
+
+#[test]
+fn builds_anthropic_web_search_client_tool_for_responses_web_search() {
+    let mut req = request(vec![message("user", "latest rust news")]);
+    req.tools = vec![json!({
+        "type": "web_search_preview",
+        "web_search": {
+            "max_uses": 3,
+            "allowed_domains": ["www.rust-lang.org"]
+        }
+    })];
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+    assert_eq!(body["tools"][0]["name"], "WebSearch");
+    assert!(body["tools"][0].get("type").is_none());
+    assert_eq!(body["tools"][0]["input_schema"]["required"][0], "query");
+    assert_eq!(
+        body["tools"][0]["input_schema"]["properties"]["allowed_domains"]["items"]["type"],
+        "string"
+    );
+}
+
+#[test]
+fn preserves_native_anthropic_web_search_server_tool() {
+    let mut req = request(vec![message("user", "latest rust news")]);
+    req.tools = vec![json!({
+        "type": ANTHROPIC_WEB_SEARCH_TYPE,
+        "name": "web_search",
+        "max_uses": 3,
+        "allowed_domains": ["www.rust-lang.org"]
+    })];
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+    assert_eq!(body["tools"][0]["type"], ANTHROPIC_WEB_SEARCH_TYPE);
+    assert_eq!(body["tools"][0]["name"], "web_search");
+    assert_eq!(body["tools"][0]["max_uses"], 3);
+    assert_eq!(body["tools"][0]["allowed_domains"][0], "www.rust-lang.org");
+}
+
+#[test]
+fn maps_responses_web_search_filters_to_anthropic_allowed_domains() {
+    let mut req = request(vec![message("user", "latest rust news")]);
+    req.tools = vec![json!({
+        "type": "web_search",
+        "external_web_access": true,
+        "search_content_types": ["text", "image"],
+        "filters": {
+            "allowed_domains": ["www.rust-lang.org"]
+        }
+    })];
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+    assert_eq!(body["tools"][0]["name"], "WebSearch");
+    assert!(body["tools"][0].get("type").is_none());
+    assert_eq!(body["tools"][0]["input_schema"]["required"][0], "query");
+    assert_eq!(
+        body["tools"][0]["input_schema"]["properties"]["allowed_domains"]["items"]["type"],
+        "string"
+    );
+    assert!(body["tools"][0].get("allowed_domains").is_none());
+    assert!(body["tools"][0].get("external_web_access").is_none());
+    assert!(body["tools"][0].get("search_content_types").is_none());
+}
+
+#[test]
+fn builds_anthropic_adaptive_thinking_from_reasoning_effort() {
+    let mut req = request(vec![message("user", "think carefully")]);
+    req.reasoning = Some(Reasoning {
+        effort: Some("max".to_string()),
+        budget_tokens: None,
+        generate_summary: None,
+    });
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert_eq!(body["output_config"]["effort"], "max");
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn builds_anthropic_budget_thinking_from_explicit_budget() {
+    let mut req = request(vec![message("user", "think carefully")]);
+    req.max_output_tokens = Some(4_096);
+    req.reasoning = Some(Reasoning {
+        effort: Some("high".to_string()),
+        budget_tokens: Some(2_048),
+        generate_summary: None,
+    });
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["thinking"]["budget_tokens"], 2_048);
+    assert!(body.get("output_config").is_none());
+}
+
+#[test]
+fn rejects_anthropic_thinking_budget_that_reaches_max_tokens() {
+    let mut req = request(vec![message("user", "think carefully")]);
+    req.max_output_tokens = Some(2_048);
+    req.reasoning = Some(Reasoning {
+        effort: Some("high".to_string()),
+        budget_tokens: Some(2_048),
+        generate_summary: None,
+    });
+
+    let err = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap_err();
+    assert!(err.message.contains("thinking.budget_tokens"));
+}
+
+#[test]
+fn builds_glm_reasoning_effort_from_reasoning() {
+    let mut req = request(vec![message("user", "think carefully")]);
+    req.reasoning = Some(Reasoning {
+        effort: Some("max".to_string()),
+        budget_tokens: None,
+        generate_summary: None,
+    });
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::GlmAnthropic).unwrap();
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["reasoning_effort"], "max");
+    assert!(body.get("output_config").is_none());
+}
+
+#[test]
+fn maps_glm_medium_reasoning_to_high() {
+    let mut req = request(vec![message("user", "think carefully")]);
+    req.reasoning = Some(Reasoning {
+        effort: Some("medium".to_string()),
+        budget_tokens: None,
+        generate_summary: None,
+    });
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::GlmAnthropic).unwrap();
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["reasoning_effort"], "high");
+}
+
+#[test]
+fn maps_glm_none_reasoning_to_disabled_thinking() {
+    let mut req = request(vec![message("user", "think carefully")]);
+    req.reasoning = Some(Reasoning {
+        effort: Some("none".to_string()),
+        budget_tokens: None,
+        generate_summary: None,
+    });
+
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::GlmAnthropic).unwrap();
+    assert_eq!(body["thinking"]["type"], "disabled");
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn converts_anthropic_text_response() {
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{"type": "text", "text": "hello back"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 3,
+            "cache_read_input_tokens": 4,
+            "cache_creation_input_tokens": 6
+        }
+    });
+
+    let converted = convert_response(&response);
+    assert_eq!(converted.id, "msg_123");
+    assert_eq!(converted.model, "claude-sonnet-4-6");
+    assert_eq!(converted.status, "completed");
+    assert_eq!(converted.output.len(), 1);
+    let Some(ItemContent::Parts(parts)) = converted.output[0].content.as_ref() else {
+        panic!("expected output_text content part");
+    };
+    assert_eq!(parts[0].part_type, "output_text");
+    assert_eq!(parts[0].text.as_deref(), Some("hello back"));
+    let usage = converted.usage.unwrap();
+    assert_eq!(usage.input_tokens, 20);
+    assert_eq!(usage.output_tokens, 3);
+    assert_eq!(usage.total_tokens, 23);
+    let details = usage.input_tokens_details.unwrap();
+    assert_eq!(details.cached_tokens, 4);
+    assert_eq!(details.cache_creation_tokens, 6);
+}
+
+#[test]
+fn converts_anthropic_text_citations_to_responses_annotations() {
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{
+            "type": "text",
+            "text": "Rust is maintained by the Rust Foundation.",
+            "citations": [{
+                "type": "web_search_result_location",
+                "url": "https://www.rust-lang.org/",
+                "title": "Rust",
+                "cited_text": "Rust language homepage"
+            }]
+        }],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 3
+        }
+    });
+
+    let converted = convert_response(&response);
+    let Some(ItemContent::Parts(parts)) = converted.output[0].content.as_ref() else {
+        panic!("expected output_text content part");
+    };
+    let annotations = parts[0].annotations.as_ref().expect("expected annotations");
+    assert_eq!(annotations.len(), 1);
+    assert_eq!(annotations[0]["type"], "url_citation");
+    assert_eq!(annotations[0]["url"], "https://www.rust-lang.org/");
+    assert_eq!(annotations[0]["title"], "Rust");
+}
+
+#[test]
+fn converts_anthropic_cache_creation_breakdown_usage() {
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{"type": "text", "text": "hello back"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 9,
+            "output_tokens": 73,
+            "cache_read_input_tokens": 5699,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 100,
+                "ephemeral_1h_input_tokens": 25
+            }
+        }
+    });
+
+    let converted = convert_response(&response);
+    let usage = converted.usage.unwrap();
+    assert_eq!(usage.input_tokens, 5833);
+    assert_eq!(usage.output_tokens, 73);
+    assert_eq!(usage.total_tokens, 5906);
+    let details = usage.input_tokens_details.unwrap();
+    assert_eq!(details.cached_tokens, 5699);
+    assert_eq!(details.cache_creation_tokens, 125);
+    assert_eq!(details.cache_creation_5m_tokens, 100);
+    assert_eq!(details.cache_creation_1h_tokens, 25);
+}
+
+#[test]
+fn converts_anthropic_thinking_response() {
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [
+            {"type": "thinking", "thinking": "I should reason first.", "signature": "sig_123"},
+            {"type": "redacted_thinking", "data": "encrypted_456"},
+            {"type": "text", "text": "final"}
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let converted = convert_response(&response);
+    assert_eq!(converted.output.len(), 3);
+    assert_eq!(converted.output[0].item_type, ItemType::Reasoning);
+    assert_eq!(
+        converted.output[0].summary.as_ref().unwrap()[0].text,
+        "I should reason first."
+    );
+    assert_eq!(
+        converted.output[0].encrypted_content.as_deref(),
+        Some("sig_123")
+    );
+    assert_eq!(converted.output[1].item_type, ItemType::Reasoning);
+    assert_eq!(
+        converted.output[1].encrypted_content.as_deref(),
+        Some("encrypted_456")
+    );
+    assert_eq!(converted.output[2].item_type, ItemType::Message);
+}
+
+#[test]
+fn scopes_anthropic_thinking_and_redacted_content_in_json_response() {
+    let scope = encrypted_content_scope(
+        "claude",
+        ProviderType::AnthropicMessages,
+        "https://api.anthropic.com/v1",
+    );
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [
+            {"type": "thinking", "thinking": "think", "signature": "sig_123"},
+            {"type": "redacted_thinking", "data": "encrypted_456"}
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let mut converted = convert_response(&response);
+    scope_anthropic_response(&mut converted, &scope);
+
+    let thinking = converted.output[0].encrypted_content.as_deref().unwrap();
+    let redacted = converted.output[1].encrypted_content.as_deref().unwrap();
+    assert!(thinking.starts_with("chatroute:enc:v1:anthropic:"));
+    assert!(redacted.starts_with("chatroute:enc:v1:anthropic:"));
+    assert_eq!(
+        scope.decode_anthropic(thinking),
+        Some((AnthropicEncryptedContentKind::Thinking, "sig_123"))
+    );
+    assert_eq!(
+        scope.decode_anthropic(redacted),
+        Some((
+            AnthropicEncryptedContentKind::RedactedThinking,
+            "encrypted_456"
+        ))
+    );
+}
+
+#[test]
+fn preserves_omitted_anthropic_thinking_signature_in_json_response() {
+    let scope = encrypted_content_scope(
+        "claude",
+        ProviderType::AnthropicMessages,
+        "https://api.anthropic.com/v1",
+    );
+    let response = json!({
+        "id": "msg_omitted",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-6",
+        "content": [
+            {"type": "thinking", "thinking": "", "signature": "sig_omitted"}
+        ],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let mut converted = convert_response(&response);
+    assert_eq!(converted.output.len(), 1);
+    assert!(converted.output[0].summary.as_ref().unwrap().is_empty());
+    scope_anthropic_response(&mut converted, &scope);
+
+    let encrypted_content = converted.output[0].encrypted_content.as_deref().unwrap();
+    assert_eq!(
+        scope.decode_anthropic(encrypted_content),
+        Some((AnthropicEncryptedContentKind::Thinking, "sig_omitted"))
+    );
+}
+
+#[test]
+fn converts_anthropic_tool_use_response() {
+    let mut map = ToolNameMap::default();
+    let encoded = map.encode_function(Some("browser"), "open page");
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{
+            "type": "tool_use",
+            "id": "toolu_123",
+            "name": encoded,
+            "input": {"url": "https://example.com"}
+        }],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let converted = convert_anthropic_response(
+        &response,
+        "fallback-model",
+        &map,
+        AnthropicProviderProfile::Anthropic,
+    );
+    assert_eq!(converted.status, "completed");
+    assert_eq!(converted.output.len(), 1);
+    let item = &converted.output[0];
+    assert_eq!(item.item_type, ItemType::FunctionCall);
+    assert_eq!(item.namespace.as_deref(), Some("browser"));
+    assert_eq!(item.name.as_deref(), Some("open page"));
+    assert_eq!(item.call_id.as_deref(), Some("toolu_123"));
+    assert_eq!(
+        item.arguments.as_ref().unwrap().to_value()["url"],
+        "https://example.com"
+    );
+}
+
+#[test]
+fn converts_anthropic_apply_patch_tool_use_to_custom_tool_call() {
+    let mut map = ToolNameMap::default();
+    map.encode_custom("apply_patch");
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "content": [{
+            "type": "tool_use",
+            "id": "toolu_patch",
+            "name": "apply_patch",
+            "input": {
+                "input": "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n"
+            }
+        }],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let converted = convert_anthropic_response(
+        &response,
+        "fallback-model",
+        &map,
+        AnthropicProviderProfile::Anthropic,
+    );
+    assert_eq!(converted.output.len(), 1);
+    let item = &converted.output[0];
+    assert_eq!(item.item_type, ItemType::CustomToolCall);
+    assert_eq!(item.name.as_deref(), Some("apply_patch"));
+    assert_eq!(item.call_id.as_deref(), Some("toolu_patch"));
+    assert_eq!(
+        item.input.as_deref(),
+        Some("*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n")
+    );
+    assert!(item.arguments.is_none());
+}
+
+#[test]
+fn passes_through_anthropic_apply_patch_tool_use_input() {
+    let mut map = ToolNameMap::default();
+    map.encode_custom("apply_patch");
+    let raw_input = "Here is the patch:\n```text\n*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n```\n";
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "content": [{
+            "type": "tool_use",
+            "id": "toolu_patch",
+            "name": "apply_patch",
+            "input": {
+                "input": raw_input
+            }
+        }],
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let converted = convert_anthropic_response(
+        &response,
+        "fallback-model",
+        &map,
+        AnthropicProviderProfile::Anthropic,
+    );
+
+    assert_eq!(converted.output[0].input.as_deref(), Some(raw_input));
+}
+
+#[test]
+fn converts_anthropic_server_web_search_response() {
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_123",
+                "name": "web_search",
+                "input": {"query": "rust 2026"}
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_123",
+                "content": [{"type": "web_search_result", "title": "Rust", "url": "https://www.rust-lang.org"}]
+            }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let converted = convert_response(&response);
+    assert_eq!(converted.output.len(), 1);
+    assert_eq!(converted.output[0].item_type, ItemType::WebSearchCall);
+    assert_eq!(converted.output[0].call_id.as_deref(), Some("srvtoolu_123"));
+    assert_eq!(
+        converted.output[0].action.as_ref().unwrap()["query"],
+        "rust 2026"
+    );
+    assert_eq!(
+        converted.output[0].action.as_ref().unwrap().get("result"),
+        None
+    );
+}
+
+#[test]
+fn converts_anthropic_tool_use_web_search_response() {
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tooluse_5gdkvmCM90l5foLBnddBYO",
+                "name": "web_search",
+                "input": {"query": "Portugal Uzbekistan World Cup 2026 result Ronaldo goal"}
+            }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let converted = convert_response(&response);
+    assert_eq!(converted.output.len(), 1);
+    assert_eq!(converted.output[0].item_type, ItemType::WebSearchCall);
+    assert_eq!(
+        converted.output[0].call_id.as_deref(),
+        Some("tooluse_5gdkvmCM90l5foLBnddBYO")
+    );
+    assert_eq!(
+        converted.output[0].action.as_ref().unwrap()["query"],
+        "Portugal Uzbekistan World Cup 2026 result Ronaldo goal"
+    );
+}
+
+#[test]
+fn reconstructs_multiple_web_search_tool_uses_from_stream() {
+    let raw_sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"WebSearch\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"World Cup results\\\"}\"}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_2\",\"name\":\"WebSearch\",\"input\":{}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"World Cup schedule\\\"}\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":8}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n"
+    );
+
+    let message = anthropic_message_from_sse(raw_sse).unwrap();
+    let tool_uses = find_web_search_tool_uses(&message);
+
+    assert_eq!(tool_uses.len(), 2);
+    assert_eq!(tool_uses[0].id, "call_1");
+    assert_eq!(tool_uses[0].query, "World Cup results");
+    assert_eq!(tool_uses[1].id, "call_2");
+    assert_eq!(tool_uses[1].query, "World Cup schedule");
+}
+
+#[test]
+fn ignores_duplicate_web_search_tool_use_ids_from_stream() {
+    let response = json!({
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "WebSearch",
+                "input": {"query": "World Cup results"}
+            },
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "WebSearch",
+                "input": {"query": "World Cup duplicate"}
+            },
+            {
+                "type": "tool_use",
+                "id": "call_2",
+                "name": "WebSearch",
+                "input": {"query": "World Cup schedule"}
+            }
+        ]
+    });
+
+    let tool_uses = find_web_search_tool_uses(&response);
+
+    assert_eq!(tool_uses.len(), 2);
+    assert_eq!(tool_uses[0].id, "call_1");
+    assert_eq!(tool_uses[0].query, "World Cup results");
+    assert_eq!(tool_uses[1].id, "call_2");
+    assert_eq!(tool_uses[1].query, "World Cup schedule");
+}
+
+#[test]
+fn appends_all_parallel_web_search_tool_results() {
+    let mut body = json!({
+        "model": "glm-5.3",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "search"}]
+        }]
+    });
+    let assistant_response = json!({
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "WebSearch",
+                "input": {"query": "World Cup results"}
+            },
+            {
+                "type": "tool_use",
+                "id": "call_2",
+                "name": "WebSearch",
+                "input": {"query": "World Cup schedule"}
+            }
+        ]
+    });
+
+    append_tool_results(
+        &mut body,
+        &assistant_response,
+        vec![
+            ("call_1".to_string(), "result one".to_string()),
+            ("call_2".to_string(), "result two".to_string()),
+            ("call_2".to_string(), "result two extra".to_string()),
+        ],
+    );
+
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[2]["role"], "user");
+    assert_eq!(messages[2]["content"][0]["tool_use_id"], "call_1");
+    assert_eq!(messages[2]["content"][0]["content"], "result one");
+    assert_eq!(messages[2]["content"][1]["tool_use_id"], "call_2");
+    assert_eq!(
+        messages[2]["content"][1]["content"],
+        "result two\n\nresult two extra"
+    );
+}
+
+#[test]
+fn normalizes_standard_web_search_results() {
+    let event = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "web_search_tool_result",
+            "content": [{
+                "type": "web_search_result",
+                "title": "Rust",
+                "url": "https://www.rust-lang.org",
+                "snippet": "A language empowering everyone."
+            }]
+        }
+    });
+    let raw_sse = format!("event: content_block_start\ndata: {event}\n\n");
+
+    let text = search_results_to_tool_text("rust language", &raw_sse);
+
+    assert!(text.contains("Rust"));
+    assert!(text.contains("URL: https://www.rust-lang.org"));
+    assert!(text.contains("Snippet: A language empowering everyone."));
+    assert!(!text.contains("No web search results were returned"));
+}
+
+#[test]
+fn normalizes_glm_nested_tool_result_content() {
+    let embedded_results = json!([[
+        {
+            "title": "OpenAI News",
+            "link": "https://openai.com/news/",
+            "content": "Latest OpenAI news.",
+            "refer": "ref_1"
+        },
+        {
+            "title": "Rust",
+            "link": "https://www.rust-lang.org/",
+            "content": "Rust language homepage.",
+            "refer": "ref_2"
+        }
+    ]]);
+    let event = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "tool_result",
+            "tool_use_id": "call_search_1",
+            "content": serde_json::to_string(&embedded_results).unwrap()
+        }
+    });
+    let raw_sse = format!("event: content_block_start\ndata: {event}\n\n");
+
+    let text = search_results_to_tool_text("OpenAI and Rust", &raw_sse);
+
+    assert!(text.contains("OpenAI News"));
+    assert!(text.contains("URL: https://openai.com/news/"));
+    assert!(text.contains("Snippet: Latest OpenAI news."));
+    assert!(text.contains("Rust language homepage."));
+    assert!(!text.contains("No web search results were returned"));
+}
+
+#[tokio::test]
+async fn forwards_a_converter_web_search_once_without_gateway_duplicate() {
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_search_1\",\"name\":\"WebSearch\",\"input\":{}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"OpenAI June 2026\\\"}\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+    let mut envelope = InternalSseEnvelope::new("resp_test".to_string(), "glm-5.3".to_string(), 0);
+    envelope.ensure_started(&tx).await.unwrap();
+    envelope.begin_round();
+    let mut converted = response_stream(input, "glm-5.3", ToolNameMap::default());
+    while let Some(frame) = converted.next().await {
+        for (event, data) in super::parse_converted_frames(&frame.unwrap()) {
+            envelope.forward_converted(&tx, &event, data).await.unwrap();
+        }
+    }
+    envelope.finish(&tx).await.unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(item) = rx.recv().await {
+        chunks.push(item.unwrap());
+    }
+    let events = parse_events_from_bytes(&chunks);
+    let searches = events
+        .iter()
+        .filter(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "web_search_call"
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(searches.len(), 1);
+    assert_eq!(searches[0].1["item"]["call_id"], "call_search_1");
+    assert_eq!(searches[0].1["item"]["action"]["query"], "OpenAI June 2026");
+}
+
+#[test]
+fn deduplicates_search_results_and_ignores_encrypted_content_as_snippet() {
+    let event = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "tool_result",
+            "tool_use_id": "call_search_1",
+            "content": [
+                {
+                    "type": "web_search_result",
+                    "title": "First title",
+                    "link": "https://example.com",
+                    "content": "Readable result"
+                },
+                {
+                    "type": "web_search_result",
+                    "title": "Duplicate title",
+                    "link": "https://example.com",
+                    "encrypted_content": "opaque-private-payload"
+                },
+                {
+                    "type": "web_search_result",
+                    "title": "Opaque only",
+                    "encrypted_content": "opaque-only-payload"
+                }
+            ]
+        }
+    });
+    let raw_sse = format!("event: content_block_start\ndata: {event}\n\n");
+
+    let text = search_results_to_tool_text("example", &raw_sse);
+
+    assert_eq!(text.matches("https://example.com").count(), 1);
+    assert!(text.contains("First title"));
+    assert!(text.contains("Snippet: Readable result"));
+    assert!(text.contains("Opaque only"));
+    assert!(!text.contains("opaque-private-payload"));
+    assert!(!text.contains("opaque-only-payload"));
+}
+
+#[test]
+fn emits_empty_search_message_only_when_no_readable_results_exist() {
+    let event = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "tool_result",
+            "tool_use_id": "call_search_1",
+            "content": "[{\"text\":[{\"encrypted_content\":\"opaque-only-payload\"}],\"type\":\"text\"}]"
+        }
+    });
+    let raw_sse = format!("event: content_block_start\ndata: {event}\n\n");
+
+    assert_eq!(
+        search_results_to_tool_text("opaque", &raw_sse),
+        "No web search results were returned for query: opaque"
+    );
+}
+
+#[test]
+fn builds_internal_web_search_body_like_claude_code() {
+    let mut headers = HeaderMap::new();
+    headers.insert("session_id", HeaderValue::from_static("session-123"));
+    let ctx = GatewayContext::extract(&headers, None);
+
+    let body = internal_web_search_body(&ctx, "claude-opus-4-8", "世界杯 2026 6月27日 比赛结果");
+
+    assert_eq!(body["model"], "claude-opus-4-8");
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["tools"][0]["name"], "web_search");
+    assert_eq!(body["tools"][0]["type"], ANTHROPIC_WEB_SEARCH_TYPE);
+    assert_eq!(body["tools"][0]["max_uses"], 8);
+    assert_eq!(
+        body["system"][0]["text"],
+        "You are Claude Code, Anthropic's official CLI for Claude."
+    );
+    assert_eq!(
+        body["system"][1]["text"],
+        "You are an assistant for performing a web search tool use"
+    );
+    assert_eq!(
+        body["messages"][0]["content"][0]["text"],
+        "Perform a web search for the query: 世界杯 2026 6月27日 比赛结果"
+    );
+    assert_eq!(body["thinking"]["type"], "disabled");
+    assert_eq!(body["max_tokens"], 64000);
+    assert_eq!(body["tool_choice"]["type"], "tool");
+    assert_eq!(body["tool_choice"]["name"], "web_search");
+    assert_eq!(body["output_config"]["effort"], "high");
+
+    let metadata_user = body["metadata"]["user_id"].as_str().unwrap();
+    let metadata: Value = serde_json::from_str(metadata_user).unwrap();
+    assert_eq!(metadata["account_uuid"], "");
+    assert_eq!(metadata["session_id"], "session-123");
+    assert_eq!(
+        metadata["device_id"]
+            .as_str()
+            .map(|value| value.len())
+            .unwrap_or_default(),
+        64
+    );
+}
+
+#[test]
+fn injects_stable_metadata_user_id_into_main_request() {
+    let mut headers = HeaderMap::new();
+    headers.insert("session_id", HeaderValue::from_static("session-123"));
+    let ctx = GatewayContext::extract(&headers, None);
+
+    let mut body = json!({"model": "claude-opus-4-8", "messages": []});
+    insert_metadata_user_id(&mut body, &ctx);
+
+    let metadata_user = body["metadata"]["user_id"].as_str().unwrap();
+    let metadata: Value = serde_json::from_str(metadata_user).unwrap();
+    assert_eq!(metadata["session_id"], "session-123");
+    assert_eq!(metadata["account_uuid"], "");
+    assert_eq!(metadata["device_id"].as_str().unwrap().len(), 64);
+}
+
+#[test]
+fn preserves_existing_metadata_user_id() {
+    let ctx = GatewayContext::extract(&HeaderMap::new(), Some("cache-key"));
+    let mut body = json!({
+        "model": "claude-opus-4-8",
+        "messages": [],
+        "metadata": {"user_id": "caller-supplied"}
+    });
+
+    insert_metadata_user_id(&mut body, &ctx);
+
+    assert_eq!(body["metadata"]["user_id"], "caller-supplied");
+}
+
+#[test]
+fn raw_sse_first_content_token_ignores_message_start_and_ping() {
+    // Anthropic emits message_start + ping frames before any real output.
+    // TTFT must not fire on those.
+    let prelude = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n",
+        "event: ping\n",
+        "data: {\"type\": \"ping\"}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    );
+    assert!(
+        !raw_sse_has_first_content_token(prelude),
+        "prelude frames must not count as first token"
+    );
+
+    let with_delta = format!(
+        "{prelude}event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"hi\"}}}}\n\n"
+    );
+    assert!(
+        raw_sse_has_first_content_token(&with_delta),
+        "first content_block_delta marks time-to-first-token"
+    );
+}
+
+#[tokio::test]
+async fn internal_envelope_streams_deltas_and_renumbers_across_rounds() {
+    use super::parse_converted_frames;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let mut envelope =
+        InternalSseEnvelope::new("resp_x".to_string(), "claude-opus-4-8".to_string(), 0);
+
+    // Round 1: the model streams text (converter emits real output_text.delta
+    // frames from content_block_delta). This is what restores the typewriter
+    // effect through the internal web-search path.
+    let round1 = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+
+    envelope.ensure_started(&tx).await.unwrap();
+    envelope.begin_round();
+    let mut converted = response_stream(round1, "claude-opus-4-8", ToolNameMap::default());
+    while let Some(frame) = converted.next().await {
+        let frame = frame.unwrap();
+        for (event, data) in parse_converted_frames(&frame) {
+            envelope.forward_converted(&tx, &event, data).await.unwrap();
+        }
+    }
+    envelope.finish(&tx).await.unwrap();
+    drop(tx);
+
+    let mut chunks = Vec::new();
+    while let Some(item) = rx.recv().await {
+        chunks.push(item.unwrap());
+    }
+    let events = parse_events_from_bytes(&chunks);
+    let names: Vec<&str> = events.iter().map(|(e, _)| e.as_str()).collect();
+
+    // Typewriter effect preserved: real output_text.delta events reach the client.
+    let deltas: Vec<&str> = events
+        .iter()
+        .filter(|(e, _)| e == "response.output_text.delta")
+        .filter_map(|(_, d)| d["delta"].as_str())
+        .collect();
+    assert_eq!(deltas, vec!["Hel", "lo"]);
+
+    // Exactly one envelope even though the converter emitted its own.
+    assert_eq!(
+        names.iter().filter(|e| **e == "response.created").count(),
+        1
+    );
+    assert_eq!(
+        names.iter().filter(|e| **e == "response.completed").count(),
+        1
+    );
+    // No stray per-round envelope leaked through.
+    assert!(!names[1..names.len() - 1].contains(&"response.created"));
+
+    // Sequence numbers are strictly increasing across the whole stream.
+    let seqs: Vec<i64> = events
+        .iter()
+        .filter_map(|(_, d)| d["sequence_number"].as_i64())
+        .collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "sequence must be monotonic: {seqs:?}"
+    );
+
+    // Terminal response carries the streamed message and merged usage.
+    let completed = events
+        .iter()
+        .find(|(e, _)| e == "response.completed")
+        .unwrap();
+    let output = completed.1["response"]["output"].as_array().unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0]["type"], "message");
+    assert_eq!(completed.1["response"]["usage"]["output_tokens"], 2);
+    // Usage is absorbed once per round from the terminal envelope only. The
+    // inner converter emits response.created + response.in_progress +
+    // response.completed, all carrying the same usage snapshot; absorbing every
+    // envelope would triple the round's input_tokens (3 -> 9) and inflate the
+    // reported context size, tripping premature compaction.
+    assert_eq!(completed.1["response"]["usage"]["input_tokens"], 3);
+}
+
+#[test]
+fn skips_empty_anthropic_internal_web_search_response() {
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tooluse_search",
+                "name": "web_search",
+                "input": {"query": "Portugal World Cup 2026 result"}
+            },
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_internal",
+                "name": "web_search"
+            },
+            {
+                "type": "web_search_tool_result",
+                "content": [
+                    {
+                        "type": "web_search_result",
+                        "title": "Portugal wins",
+                        "url": "https://example.com"
+                    }
+                ]
+            }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let converted = convert_response(&response);
+    assert_eq!(converted.output.len(), 1);
+    assert_eq!(converted.output[0].item_type, ItemType::WebSearchCall);
+    assert_eq!(
+        converted.output[0].call_id.as_deref(),
+        Some("tooluse_search")
+    );
+    assert_eq!(
+        converted.output[0].action.as_ref().unwrap()["query"],
+        "Portugal World Cup 2026 result"
+    );
+}
+
+#[test]
+fn preserves_mapped_function_named_web_search_response() {
+    let mut map = ToolNameMap::default();
+    map.encode_function(None, "web_search");
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tooluse_function_search",
+                "name": "web_search",
+                "input": {"query": "local function call"}
+            }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let converted = convert_anthropic_response(
+        &response,
+        "fallback-model",
+        &map,
+        AnthropicProviderProfile::Anthropic,
+    );
+
+    assert_eq!(converted.output.len(), 1);
+    assert_eq!(converted.output[0].item_type, ItemType::FunctionCall);
+    assert_eq!(converted.output[0].name.as_deref(), Some("web_search"));
+    assert_eq!(
+        converted.output[0]
+            .arguments
+            .as_ref()
+            .map(|arguments| arguments.to_chat_arguments())
+            .as_deref(),
+        Some("{\"query\":\"local function call\"}")
+    );
+}
+
+#[test]
+fn converts_glm_web_search_prime_response() {
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "glm-5.3",
+        "content": [
+            {
+                "type": "server_tool_use",
+                "id": "call_search_1",
+                "name": "web_search_prime",
+                "input": {"search_query": "OpenAI June 2026", "location": "us"}
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_search_1",
+                "content": "[{'text': [{'title': 'OpenAI News', 'link': 'https://openai.com/news/', 'content': 'Latest ...'}], 'type': 'text'}]"
+            },
+            {"type": "text", "text": "Done"}
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let converted = convert_glm_response(&response);
+    assert_eq!(converted.output.len(), 2);
+    assert_eq!(converted.output[0].item_type, ItemType::WebSearchCall);
+    assert_eq!(
+        converted.output[0].call_id.as_deref(),
+        Some("call_search_1")
+    );
+    assert_eq!(
+        converted.output[0].action.as_ref().unwrap()["query"],
+        "OpenAI June 2026"
+    );
+    assert_eq!(
+        converted.output[0].action.as_ref().unwrap().get("result"),
+        None
+    );
+    assert_eq!(converted.output[1].item_type, ItemType::Message);
+}
+
+#[test]
+fn filters_glm_private_web_search_text_from_response() {
+    let response = json!({
+        "id": "msg_123",
+        "type": "message",
+        "role": "assistant",
+        "model": "glm-5.3",
+        "content": [
+            {
+                "type": "text",
+                "text": "**\u{1f310} Z.ai Built-in Tool: web_search_prime**\n\n**Input:**\n```json\n{\"search_query\":\"OpenAI June 2026\"}\n```\n*Executing on server...*\n"
+            },
+            {
+                "type": "server_tool_use",
+                "id": "call_search_1",
+                "name": "web_search_prime",
+                "input": {"search_query": "OpenAI June 2026"}
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_search_1",
+                "content": "[{\"text\":[{\"title\":\"OpenAI News\"}],\"type\":\"text\"}]"
+            },
+            {
+                "type": "text",
+                "text": "**Output:**\n**web_search_prime_result_summary:** [{\"text\":[{\"title\":\"OpenAI News\"}]}]\n                                                Final answer"
+            }
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+
+    let converted = convert_glm_response(&response);
+    assert_eq!(converted.output.len(), 2);
+    assert_eq!(converted.output[0].item_type, ItemType::WebSearchCall);
+    assert_eq!(
+        converted.output[0].action.as_ref().unwrap().get("result"),
+        None
+    );
+    assert_eq!(converted.output[1].item_type, ItemType::Message);
+    let Some(ItemContent::Parts(parts)) = converted.output[1].content.as_ref() else {
+        panic!("expected message parts");
+    };
+    assert_eq!(parts[0].text.as_deref(), Some("Final answer"));
+    let encoded = serde_json::to_string(&converted).unwrap();
+    assert!(!encoded.contains("web_search_prime"));
+    assert!(!encoded.contains("web_search_prime_result_summary"));
+}
+
+#[tokio::test]
+async fn streams_anthropic_thinking_as_responses_reasoning_sse() {
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"I should\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" think\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_123\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"final\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+
+    let chunks = response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+
+    assert!(events.iter().any(
+        |(event, data)| event == "response.reasoning_summary_text.delta"
+            && data["delta"] == "I should"
+    ));
+    let reasoning_done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "reasoning"
+        })
+        .unwrap();
+    assert_eq!(
+        reasoning_done.1["item"]["summary"][0]["text"],
+        "I should think"
+    );
+    assert_eq!(reasoning_done.1["item"]["encrypted_content"], "sig_123");
+
+    let reasoning_done_pos = events
+        .iter()
+        .position(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "reasoning"
+        })
+        .unwrap();
+    let text_delta_pos = events
+        .iter()
+        .position(|(event, data)| event == "response.output_text.delta" && data["delta"] == "final")
+        .unwrap();
+    assert!(reasoning_done_pos < text_delta_pos);
+}
+
+#[tokio::test]
+async fn scopes_anthropic_thinking_in_responses_sse() {
+    let scope = encrypted_content_scope(
+        "claude",
+        ProviderType::AnthropicMessages,
+        "https://api.anthropic.com/v1",
+    );
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"think\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_123\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+    let converted = response_stream(input, "fallback-model", ToolNameMap::default());
+    let chunks = ResponsesCompatSseStream::with_encrypted_content_scope(converted, scope.clone())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let joined = chunks
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect::<Vec<_>>();
+    let events = super::parse_converted_frames(&Bytes::from(joined));
+
+    let reasoning_done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "reasoning"
+        })
+        .unwrap();
+    let encrypted_content = reasoning_done.1["item"]["encrypted_content"]
+        .as_str()
+        .unwrap();
+    assert!(encrypted_content.starts_with("chatroute:enc:v1:anthropic:"));
+    assert_eq!(
+        scope.decode_anthropic(encrypted_content),
+        Some((AnthropicEncryptedContentKind::Thinking, "sig_123"))
+    );
+
+    let completed = events
+        .iter()
+        .find(|(event, _)| event == "response.completed")
+        .unwrap();
+    let completed_content = completed.1["response"]["output"][0]["encrypted_content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        scope.decode_anthropic(completed_content),
+        Some((AnthropicEncryptedContentKind::Thinking, "sig_123"))
+    );
+}
+
+#[tokio::test]
+async fn keeps_streamed_thinking_and_redacted_blocks_distinct() {
+    let scope = encrypted_content_scope(
+        "claude",
+        ProviderType::AnthropicMessages,
+        "https://api.anthropic.com/v1",
+    );
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"sig_omitted\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"encrypted_456\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+    let converted = response_stream(input, "fallback-model", ToolNameMap::default());
+    let chunks = ResponsesCompatSseStream::with_encrypted_content_scope(converted, scope.clone())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let joined = chunks
+        .iter()
+        .flat_map(|chunk| chunk.iter().copied())
+        .collect::<Vec<_>>();
+    let events = super::parse_converted_frames(&Bytes::from(joined));
+    let reasoning_items = events
+        .iter()
+        .filter(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "reasoning"
+        })
+        .map(|(_, data)| &data["item"])
+        .collect::<Vec<_>>();
+    let added_items = events
+        .iter()
+        .filter(|(event, data)| {
+            event == "response.output_item.added" && data["item"]["type"] == "reasoning"
+        })
+        .map(|(_, data)| &data["item"])
+        .collect::<Vec<_>>();
+
+    assert_eq!(added_items.len(), 2);
+    assert_eq!(added_items[0]["summary"], json!([]));
+    assert!(added_items[1].get("summary").is_none());
+    assert_eq!(reasoning_items.len(), 2);
+    assert_eq!(reasoning_items[0]["summary"], json!([]));
+    assert!(reasoning_items[1].get("summary").is_none());
+    assert_eq!(
+        scope.decode_anthropic(reasoning_items[0]["encrypted_content"].as_str().unwrap()),
+        Some((AnthropicEncryptedContentKind::Thinking, "sig_omitted"))
+    );
+    assert_eq!(
+        scope.decode_anthropic(reasoning_items[1]["encrypted_content"].as_str().unwrap()),
+        Some((
+            AnthropicEncryptedContentKind::RedactedThinking,
+            "encrypted_456"
+        ))
+    );
+}
+
+#[tokio::test]
+async fn streams_anthropic_text_as_responses_sse() {
+    let input = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )),
+        ]);
+
+    let chunks = response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+
+    assert!(events.iter().any(|(event, _)| event == "response.created"));
+    assert!(
+        events
+            .iter()
+            .any(|(event, data)| event == "response.output_text.delta" && data["delta"] == "hello")
+    );
+    let completed = events
+        .iter()
+        .find(|(event, _)| event == "response.completed")
+        .unwrap();
+    assert_eq!(completed.1["response"]["id"], "msg_1");
+    assert_eq!(completed.1["response"]["usage"]["input_tokens"], 9);
+    assert_eq!(completed.1["response"]["usage"]["output_tokens"], 1);
+    assert_eq!(
+        completed.1["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+        3
+    );
+    assert_eq!(
+        completed.1["response"]["usage"]["input_tokens_details"]["cache_creation_tokens"],
+        4
+    );
+}
+
+#[tokio::test]
+async fn preserves_message_start_input_when_delta_reports_cache_usage() {
+    // Mirrors request log 22885: uncached input is reported at message_start,
+    // while the terminal delta reports cache usage and input_tokens = 0.
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",\"content\":[],\"usage\":{\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"input_tokens\":26219,\"output_tokens\":1}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"cache_creation_input_tokens\":617,\"cache_read_input_tokens\":45442,\"input_tokens\":0,\"output_tokens\":580}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+
+    let chunks = response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+    let completed = events
+        .iter()
+        .find(|(event, _)| event == "response.completed")
+        .unwrap();
+    let usage = &completed.1["response"]["usage"];
+
+    assert_eq!(usage["input_tokens"], 72_278);
+    assert_eq!(usage["output_tokens"], 580);
+    assert_eq!(usage["total_tokens"], 72_858);
+    assert_eq!(usage["input_tokens_details"]["cached_tokens"], 45_442);
+    assert_eq!(usage["input_tokens_details"]["cache_creation_tokens"], 617);
+}
+
+#[tokio::test]
+async fn streams_anthropic_tool_use_as_responses_sse() {
+    let mut map = ToolNameMap::default();
+    let encoded = map.encode_function(Some("browser"), "open page");
+    let start = format!(
+        "event: content_block_start\ndata: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"{encoded}\",\"input\":{{}}}}}}\n\n"
+    );
+    let input = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+            )),
+            Ok(Bytes::from(start)),
+            Ok(Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"url\\\":\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"https://example.com\\\"}\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )),
+        ]);
+
+    let chunks = response_stream(input, "fallback-model", map)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+
+    assert!(events.iter().any(
+        |(event, data)| event == "response.function_call_arguments.delta"
+            && data["delta"] == "{\"url\":"
+    ));
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "function_call"
+        })
+        .unwrap();
+    assert_eq!(done.1["item"]["namespace"], "browser");
+    assert_eq!(done.1["item"]["name"], "open page");
+    assert_eq!(
+        done.1["item"]["arguments"],
+        "{\"url\":\"https://example.com\"}"
+    );
+}
+
+#[tokio::test]
+async fn streams_anthropic_apply_patch_tool_use_as_custom_tool_call() {
+    let mut map = ToolNameMap::default();
+    map.encode_custom("apply_patch");
+    let input = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_patch\",\"name\":\"apply_patch\",\"input\":{}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"input\\\":\\\"Here is the patch:\\\\n*** Begin Patch\\\\n\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"*** Add File: hello.txt\\\\n+hello\\\\n*** End Patch\\\\n\\\"}\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )),
+        ]);
+
+    let chunks = response_stream(input, "fallback-model", map)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+
+    assert!(
+        events
+            .iter()
+            .any(|(event, _)| event == "response.custom_tool_call_input.done")
+    );
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "custom_tool_call"
+        })
+        .unwrap();
+    assert_eq!(done.1["item"]["name"], "apply_patch");
+    assert_eq!(
+        done.1["item"]["input"],
+        "Here is the patch:\n*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch\n"
+    );
+}
+
+#[tokio::test]
+async fn streams_anthropic_web_search_as_responses_sse() {
+    let input = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\": \\\"rust 2026\\\"}\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_1\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"Rust\",\"url\":\"https://www.rust-lang.org\"}]}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )),
+        ]);
+
+    let chunks = response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+
+    assert!(
+        events
+            .iter()
+            .any(|(event, data)| event == "response.output_item.added"
+                && data["item"]["type"] == "web_search_call"
+                && data["item"]["status"] == "in_progress"
+                && data["item"].get("action").is_none())
+    );
+    assert!(events.iter().any(|(event, data)| {
+        event == "response.web_search_call.in_progress" && data["output_index"].as_u64().is_some()
+    }));
+    assert!(events.iter().any(|(event, data)| {
+        event == "response.web_search_call.searching" && data["output_index"].as_u64().is_some()
+    }));
+    assert!(events.iter().any(|(event, data)| {
+        event == "response.web_search_call.completed" && data["output_index"].as_u64().is_some()
+    }));
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "web_search_call"
+        })
+        .unwrap();
+    assert_eq!(done.1["item"]["call_id"], "srvtoolu_1");
+    assert_eq!(done.1["item"]["action"]["type"], "search");
+    assert_eq!(done.1["item"]["action"]["query"], "rust 2026");
+    assert_eq!(done.1["item"]["action"]["queries"][0], "rust 2026");
+    assert!(done.1["item"]["action"].get("result").is_none());
+}
+
+#[tokio::test]
+async fn streams_anthropic_citations_as_responses_annotations() {
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"citations_delta\",\"citation\":{\"type\":\"web_search_result_location\",\"url\":\"https://www.rust-lang.org/\",\"title\":\"Rust\",\"cited_text\":\"Rust language homepage\"}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Rust has a homepage.\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+
+    let chunks = response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+
+    assert!(events.iter().any(
+        |(event, data)| event == "response.output_text.annotation.added"
+            && data["annotation"]["type"] == "url_citation"
+            && data["annotation"]["url"] == "https://www.rust-lang.org/"
+    ));
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "message"
+        })
+        .unwrap();
+    let annotation = &done.1["item"]["content"][0]["annotations"][0];
+    assert_eq!(annotation["type"], "url_citation");
+    assert_eq!(annotation["url"], "https://www.rust-lang.org/");
+    assert_eq!(annotation["title"], "Rust");
+    assert_eq!(annotation["start_index"], 0);
+    assert_eq!(annotation["end_index"], 20);
+}
+
+#[tokio::test]
+async fn streams_anthropic_tool_use_web_search_as_responses_sse() {
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tooluse_5gdkvmCM90l5foLBnddBYO\",\"name\":\"web_search\",\"input\":{\"query\":\"Portugal Uzbekistan World Cup 2026 result Ronaldo goal\"}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+
+    let chunks = response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+
+    assert!(
+        events
+            .iter()
+            .any(|(event, data)| event == "response.output_item.added"
+                && data["item"]["type"] == "web_search_call"
+                && data["item"]["status"] == "in_progress")
+    );
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "web_search_call"
+        })
+        .unwrap();
+    assert_eq!(done.1["item"]["call_id"], "tooluse_5gdkvmCM90l5foLBnddBYO");
+    assert_eq!(
+        done.1["item"]["action"]["query"],
+        "Portugal Uzbekistan World Cup 2026 result Ronaldo goal"
+    );
+}
+
+#[tokio::test]
+async fn streams_skip_empty_anthropic_internal_web_search_sse() {
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tooluse_search\",\"name\":\"web_search\",\"input\":{}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\": \\\"Portugal World Cup 2026 result\\\"}\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_internal\",\"name\":\"web_search\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"Portugal wins\",\"url\":\"https://example.com\"}]}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+
+    let chunks = response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+    let done_searches = events
+        .iter()
+        .filter(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "web_search_call"
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(done_searches.len(), 1);
+    assert_eq!(done_searches[0].1["item"]["call_id"], "tooluse_search");
+    assert_eq!(
+        done_searches[0].1["item"]["action"]["query"],
+        "Portugal World Cup 2026 result"
+    );
+}
+
+#[tokio::test]
+async fn streams_glm_web_search_prime_as_responses_sse() {
+    let input = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"call_search_1\",\"name\":\"web_search_prime\",\"input\":{\"search_query\":\"OpenAI June 2026\"}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_result\",\"tool_use_id\":\"call_search_1\",\"content\":\"[{\\\"text\\\":[{\\\"title\\\":\\\"OpenAI News\\\",\\\"link\\\":\\\"https://openai.com/news/\\\"}],\\\"type\\\":\\\"text\\\"}]\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )),
+        ]);
+
+    let chunks = glm_response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+
+    assert!(
+        events
+            .iter()
+            .any(|(event, data)| event == "response.output_item.added"
+                && data["item"]["type"] == "web_search_call"
+                && data["item"]["status"] == "in_progress"
+                && data["item"].get("action").is_none())
+    );
+    assert!(events.iter().any(|(event, data)| {
+        event == "response.web_search_call.in_progress" && data["output_index"].as_u64().is_some()
+    }));
+    assert!(events.iter().any(|(event, data)| {
+        event == "response.web_search_call.searching" && data["output_index"].as_u64().is_some()
+    }));
+    assert!(events.iter().any(|(event, data)| {
+        event == "response.web_search_call.completed" && data["output_index"].as_u64().is_some()
+    }));
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "web_search_call"
+        })
+        .unwrap();
+    assert_eq!(done.1["item"]["call_id"], "call_search_1");
+    assert_eq!(done.1["item"]["action"]["query"], "OpenAI June 2026");
+    assert_eq!(done.1["item"]["action"]["queries"][0], "OpenAI June 2026");
+    assert!(done.1["item"]["action"].get("result").is_none());
+}
+
+#[tokio::test]
+async fn streams_glm_private_web_search_text_is_filtered() {
+    let input = stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from_static(
+                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"**\u{1f310} Z.ai Built-in Tool: web_search_prime**\\n\\n**Input:**\\n```json\\n{\\\"search_query\\\":\\\"OpenAI June 2026\\\"}\\n```\\n*Executing on server...*\\n\"}}\n\n".as_bytes(),
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"call_search_1\",\"name\":\"web_search_prime\",\"input\":{\"search_query\":\"OpenAI June 2026\"}}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_result\",\"tool_use_id\":\"call_search_1\",\"content\":\"[{\\\"text\\\":[{\\\"title\\\":\\\"OpenAI News\\\"}],\\\"type\\\":\\\"text\\\"}]\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"text_delta\",\"text\":\"**Output:**\\n**web_search_prime_result_summary:** [{\\\"text\\\":[{\\\"title\\\":\\\"OpenAI News\\\"}]}]\\n                                                Final answer\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":3}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            )),
+        ]);
+
+    let chunks = glm_response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let raw = String::from_utf8_lossy(&chunks.concat()).into_owned();
+    assert!(!raw.contains("web_search_prime"));
+    assert!(!raw.contains("web_search_prime_result_summary"));
+
+    let events = parse_events_from_bytes(&chunks);
+    assert!(
+        events
+            .iter()
+            .any(|(event, data)| event == "response.output_text.delta"
+                && data["delta"] == "Final answer")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|(event, data)| event == "response.output_item.done"
+                && data["item"]["type"] == "web_search_call"
+                && data["item"]["action"].get("result").is_none())
+    );
+}
+
+#[test]
+fn request_defaults_max_tokens_when_codex_omits_it() {
+    let mut req = request(vec![message("user", "Hello")]);
+    req.max_output_tokens = None;
+    let (body, _) = build_anthropic_request(&req, AnthropicProviderProfile::Anthropic).unwrap();
+    assert_eq!(body["max_tokens"], json!(super::types::DEFAULT_MAX_TOKENS));
+    assert_eq!(super::types::DEFAULT_MAX_TOKENS, 64000);
+}
+
+#[tokio::test]
+async fn streams_glm_plain_text_token_by_token() {
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"glm-5.3\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"!\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+
+    let chunks = glm_response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+
+    let deltas = events
+        .iter()
+        .filter(|(event, _)| event == "response.output_text.delta")
+        .map(|(_, data)| data["delta"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(deltas, vec!["Hello", " world", "!"]);
+    let done = events
+        .iter()
+        .find(|(event, data)| {
+            event == "response.output_item.done" && data["item"]["type"] == "message"
+        })
+        .unwrap();
+    assert_eq!(done.1["item"]["content"][0]["text"], "Hello world!");
+}
+
+#[test]
+fn non_streaming_max_tokens_stop_sets_incomplete_details() {
+    let response = json!({
+        "id": "msg_incomplete",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "stop_reason": "max_tokens",
+        "content": [{"type": "text", "text": "partial"}],
+        "usage": {"input_tokens": 10, "output_tokens": 4096}
+    });
+    let converted = convert_response(&response);
+    assert_eq!(converted.status, "incomplete");
+    assert_eq!(
+        converted.incomplete_details,
+        Some(json!({ "reason": "max_output_tokens" }))
+    );
+}
+
+#[test]
+fn non_streaming_end_turn_has_no_incomplete_details() {
+    let response = json!({
+        "id": "msg_done",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-4-8",
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "done"}],
+        "usage": {"input_tokens": 10, "output_tokens": 3}
+    });
+    let converted = convert_response(&response);
+    assert_eq!(converted.status, "completed");
+    assert_eq!(converted.incomplete_details, None);
+}
+
+#[tokio::test]
+async fn streams_max_tokens_stop_as_response_incomplete_with_reason() {
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":4096,\"output_tokens_details\":{\"thinking_tokens\":3338}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+
+    let chunks = response_stream(input, "fallback-model", ToolNameMap::default())
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let events = parse_events_from_bytes(&chunks);
+
+    let incomplete = events
+        .iter()
+        .find(|(event, _)| event == "response.incomplete")
+        .expect("expected response.incomplete event");
+    assert_eq!(incomplete.1["response"]["status"], "incomplete");
+    assert_eq!(
+        incomplete.1["response"]["incomplete_details"]["reason"],
+        "max_output_tokens"
+    );
+    assert_eq!(
+        incomplete.1["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+        3338
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(event, _)| event == "response.completed")
+    );
+}
+
+#[tokio::test]
+async fn anthropic_stream_records_ttft_end_to_end() {
+    // Reproduces the real gateway path: raw Anthropic SSE flows through the
+    // AnthropicSseToResponsesSse converter and then the ResponsesSseLogStream
+    // that is responsible for recording TTFT. This is the pipeline that runs in
+    // production, unlike unit tests that feed already-converted events directly
+    // to the log stream.
+    let db_path = std::env::temp_dir().join(format!(
+        "chatroute-anthropic-ttft-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = RequestLogStore::new(db_path.clone());
+    let record = RequestLogRecord {
+        request_id: "req-anthropic-e2e".to_string(),
+        model_id: "claude-opus-4-8".to_string(),
+        stream: true,
+        channel: "anthropic".to_string(),
+        provider_type: "anthropic_messages".to_string(),
+        status: "running".to_string(),
+        usage: LogUsage::default(),
+        cost_usd: None,
+        latency_ms: None,
+        ttft_ms: None,
+        created_at_ms: 0,
+        error_message: None,
+        request_headers_json: None,
+        request_json: None,
+        upstream_request_body_bytes: None,
+        upstream_request_headers_json: None,
+        upstream_request_json: None,
+        upstream_response_sse: None,
+        response_json: None,
+    };
+    let log_id = store.insert_record(&record).unwrap();
+    let context = RequestLogContext {
+        store: store.clone(),
+        log_id,
+        started_at: Instant::now(),
+        details_enabled: true,
+        stream_failure_callback: None,
+    };
+
+    let input = stream::iter(vec![
+        Ok::<_, std::io::Error>(Bytes::from_static(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-4-8\",\"content\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+        )),
+        Ok(Bytes::from_static(
+            b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )),
+    ]);
+
+    let converted = response_stream(input, "fallback-model", ToolNameMap::default());
+    let mut logged = ResponsesSseLogStream::new(converted, context);
+    while let Some(item) = logged.next().await {
+        assert!(item.is_ok());
+    }
+    drop(logged);
+
+    let detail = store.get_detail(log_id).unwrap().unwrap();
+    assert!(
+        detail.summary.ttft_ms.is_some(),
+        "ttft should be recorded from the first converted response.*.delta event"
+    );
+    let _ = std::fs::remove_file(db_path);
+}
+#[tokio::test]
+async fn anthropic_real_fixture_records_ttft_bytewise() {
+    // Feed a captured real Anthropic SSE transcript one byte at a time so we
+    // exercise the worst-case network chunking against the exact converter +
+    // log-stream pipeline the gateway uses in production.
+    let raw = include_bytes!("testdata/real_anthropic_ttft.sse");
+    let db_path = std::env::temp_dir().join(format!(
+        "chatroute-anthropic-fixture-ttft-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = RequestLogStore::new(db_path.clone());
+    let record = RequestLogRecord {
+        request_id: "req-anthropic-fixture".to_string(),
+        model_id: "claude-opus-4-8".to_string(),
+        stream: true,
+        channel: "anthropic".to_string(),
+        provider_type: "anthropic_messages".to_string(),
+        status: "running".to_string(),
+        usage: LogUsage::default(),
+        cost_usd: None,
+        latency_ms: None,
+        ttft_ms: None,
+        created_at_ms: 0,
+        error_message: None,
+        request_headers_json: None,
+        request_json: None,
+        upstream_request_body_bytes: None,
+        upstream_request_headers_json: None,
+        upstream_request_json: None,
+        upstream_response_sse: None,
+        response_json: None,
+    };
+    let log_id = store.insert_record(&record).unwrap();
+    let context = RequestLogContext {
+        store: store.clone(),
+        log_id,
+        started_at: Instant::now(),
+        details_enabled: true,
+        stream_failure_callback: None,
+    };
+
+    let chunks: Vec<Result<Bytes, std::io::Error>> = raw
+        .iter()
+        .map(|b| Ok(Bytes::copy_from_slice(&[*b])))
+        .collect();
+    let input = stream::iter(chunks);
+    let converted = response_stream(input, "fallback-model", ToolNameMap::default());
+    let mut logged = ResponsesSseLogStream::new(converted, context);
+    while let Some(item) = logged.next().await {
+        assert!(item.is_ok());
+    }
+    drop(logged);
+
+    let detail = store.get_detail(log_id).unwrap().unwrap();
+    assert!(
+        detail.summary.ttft_ms.is_some(),
+        "ttft should be recorded for a real Anthropic transcript"
+    );
+    let _ = std::fs::remove_file(db_path);
+}

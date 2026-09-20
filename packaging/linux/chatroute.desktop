@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ChatRoute
+Comment=Remote-control Codex from Feishu, WeChat, and Telegram
+Exec=chatroute
+Icon=chatroute
+Terminal=false
+Categories=Development;Utility;

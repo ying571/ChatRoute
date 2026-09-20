@@ -1,0 +1,64 @@
+[package]
+name = "chatroute"
+version = "1.0.0"
+edition = "2024"
+license = "Apache-2.0"
+build = "build.rs"
+autobins = false
+
+[dependencies]
+anyhow = "1"
+aes = "0.8"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+cipher = "0.4"
+ecb = "0.1"
+futures-util = "0.3"
+fs2 = "0.4"
+hex = "0.4"
+image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
+mime_guess = "2"
+md5 = "0.7"
+once_cell = "1"
+prost = "0.13"
+qrcode = "0.14"
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "stream", "gzip", "deflate", "brotli", "zstd", "system-proxy", "socks"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+toml = "0.8"
+toml_edit = "0.22"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+wxdragon = { version = "0.9.17", optional = true }
+zip = { version = "2", default-features = false }
+zstd = "0.13"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+winreg = "0.55"
+
+[build-dependencies]
+embed-resource = "3.0.6"
+
+[features]
+gui = ["dep:image", "dep:wxdragon", "wxdragon/stc", "reqwest/blocking"]
+
+[patch.crates-io]
+wxdragon = { path = "vendor/wxdragon/rust/wxdragon" }
+wxdragon-sys = { path = "vendor/wxdragon/rust/wxdragon-sys" }
+wxdragon-macros = { path = "vendor/wxdragon/rust/wxdragon-macros" }
+
+[[bin]]
+name = "chatroute"
+path = "src/main.rs"

@@ -1,0 +1,2489 @@
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use axum::{
+    body::{Body, Bytes},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    response::Response,
+};
+use futures_util::{Stream, StreamExt};
+use serde_json::{Value, json};
+use tracing::{debug, error, warn};
+
+use crate::ai_gateway::apply_patch_tool::APPLY_PATCH_TOOL_NAME;
+use crate::ai_gateway::config::{ProviderConfig, ProviderType, provider_api_root};
+use crate::ai_gateway::context::{GatewayContext, apply_upstream_headers};
+use crate::ai_gateway::encrypted_content::{
+    EncryptedContentScope, prepare_responses_request, remove_all_responses_encrypted_content,
+};
+use crate::ai_gateway::error::GatewayError;
+use crate::ai_gateway::request_log::{
+    self, RequestLogContext, RequestLogUpdate, ResponsesSseLogStream, UpstreamSseCaptureStream,
+};
+use crate::ai_gateway::responses_compat::{
+    ResponsesCompatSseStream, normalize_json_body_with_scope_and_tool_names,
+};
+use crate::ai_gateway::tool_names::{GROK_READ_FILE_TOOL_NAME, ToolNameMap, VIEW_IMAGE_TOOL_NAME};
+
+use super::{
+    apply_total_request_timeout, ensure_success_response, execute_stream_start,
+    execute_upstream_request, upstream_transport_retry_delay,
+};
+
+const UPSTREAM_REQUEST_BODY_READ_MAX_RETRIES: usize = 2;
+const DEEPSEEK_FLASH_VISION_MODEL: &str = "deepseek-v4-flash-vision-exp";
+
+fn normalize_kimi_web_search(body: &mut serde_json::Value) {
+    fn normalize_tools(container: &mut serde_json::Value) {
+        let Some(tools) = container
+            .get_mut("tools")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
+        for tool in tools {
+            match tool.get("type").and_then(serde_json::Value::as_str) {
+                Some("web_search") => {
+                    if let Some(object) = tool.as_object_mut() {
+                        object.remove("search_context_size");
+                    }
+                }
+                Some("namespace") => normalize_tools(tool),
+                _ => {}
+            }
+        }
+    }
+
+    normalize_tools(body);
+    if let Some(input) = body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for item in input {
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("additional_tools") {
+                normalize_tools(item);
+            }
+        }
+    }
+}
+
+type SseByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
+/// Holds upstream SSE events until the request has either failed or produced a
+/// token/tool delta. This makes an error before useful output safe to retry on
+/// another provider without leaking a failed `response.created` to Codex.
+struct PrimedSseStream {
+    inner: SseByteStream,
+    buffered: VecDeque<Bytes>,
+}
+
+impl Stream for PrimedSseStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(chunk) = this.buffered.pop_front() {
+            return Poll::Ready(Some(Ok(chunk)));
+        }
+        this.inner.as_mut().poll_next(cx)
+    }
+}
+
+async fn prime_sse_stream(
+    mut inner: SseByteStream,
+    provider: &ProviderConfig,
+) -> Result<PrimedSseStream, GatewayError> {
+    let mut buffered = VecDeque::new();
+    let mut line_buf = Vec::new();
+
+    loop {
+        let Some(item) = inner.next().await else {
+            return Err(GatewayError::upstream_provider(
+                StatusCode::BAD_GATEWAY,
+                &provider.name,
+                "upstream stream closed before producing output",
+                None,
+                None,
+            ));
+        };
+        let chunk = item.map_err(|error| {
+            GatewayError::upstream_provider(
+                StatusCode::BAD_GATEWAY,
+                &provider.name,
+                format!("upstream stream failed before producing output: {error}"),
+                None,
+                None,
+            )
+        })?;
+
+        let ready = inspect_priming_sse_chunk(&chunk, &mut line_buf, provider)?;
+        buffered.push_back(chunk);
+        if ready {
+            return Ok(PrimedSseStream { inner, buffered });
+        }
+    }
+}
+
+fn inspect_priming_sse_chunk(
+    chunk: &Bytes,
+    line_buf: &mut Vec<u8>,
+    provider: &ProviderConfig,
+) -> Result<bool, GatewayError> {
+    line_buf.extend_from_slice(chunk);
+    let mut ready = false;
+
+    while let Some(newline) = line_buf.iter().position(|byte| *byte == b'\n') {
+        let mut line: Vec<u8> = line_buf.drain(..=newline).collect();
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let Ok(line) = std::str::from_utf8(&line) else {
+            continue;
+        };
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.strip_prefix(' ').unwrap_or(data);
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+
+        if let Some(error) = upstream_sse_failure(&event, provider) {
+            return Err(error);
+        }
+
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+        if event_type.starts_with("response.")
+            && event_type.ends_with(".delta")
+            && is_material_sse_delta(&event)
+        {
+            ready = true;
+        }
+        if event_type == "response.completed" {
+            ready = true;
+        }
+    }
+
+    Ok(ready)
+}
+
+/// Some upstreams emit empty SSE frames solely to keep the connection alive
+/// before they decide whether a request can run. Do not commit those frames to
+/// the client: a later `response.failed` can then still fail over cleanly.
+fn is_material_sse_delta(event: &Value) -> bool {
+    if event
+        .get("SSE-Keep-Alive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || event
+            .get("_cpa_ttft_keepalive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return false;
+    }
+
+    match event.get("delta") {
+        Some(Value::String(delta)) => !delta.is_empty(),
+        Some(Value::Array(delta)) => !delta.is_empty(),
+        Some(Value::Object(delta)) => !delta.is_empty(),
+        Some(Value::Bool(_) | Value::Number(_)) => true,
+        Some(Value::Null) | None => false,
+    }
+}
+
+fn upstream_sse_failure(event: &Value, provider: &ProviderConfig) -> Option<GatewayError> {
+    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+    let response = event.get("response");
+    let failed = event_type == "error"
+        || event_type == "response.failed"
+        || response
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            == Some("failed");
+    if !failed {
+        return None;
+    }
+
+    let error = event
+        .get("error")
+        .or_else(|| response.and_then(|value| value.get("error")));
+    let message = error
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("upstream stream reported a failed response")
+        .to_string();
+    let error_type = error
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let code = error
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let status = if is_immediate_failover_error(&message, code.as_deref()) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
+
+    Some(GatewayError::upstream_provider(
+        status,
+        &provider.name,
+        message,
+        error_type,
+        code,
+    ))
+}
+
+pub(crate) fn is_immediate_failover_error(message: &str, code: Option<&str>) -> bool {
+    let text = format!("{} {}", message, code.unwrap_or_default()).to_ascii_lowercase();
+    [
+        "at capacity",
+        "overloaded",
+        "pending requests",
+        "concurrency limit",
+        "rate limit",
+        "insufficient account balance",
+        "insufficient balance",
+        "balance insufficient",
+        "insufficient funds",
+        "quota exceeded",
+        "payment required",
+        "server_is_overloaded",
+        "stream closed before",
+        "stream failed before",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn resolve_deepseek_upstream_model(provider: &ProviderConfig, upstream_model: &str) -> String {
+    if provider.provider_type == ProviderType::DeepSeekResponses
+        && upstream_model.eq_ignore_ascii_case("deepseek-v4-flash")
+    {
+        DEEPSEEK_FLASH_VISION_MODEL.to_string()
+    } else {
+        upstream_model.to_string()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ResponsesEndpoint {
+    Responses,
+    Compact,
+}
+
+impl ResponsesEndpoint {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Responses => "/v1/responses",
+            Self::Compact => "/v1/responses/compact",
+        }
+    }
+
+    fn is_compact(self) -> bool {
+        matches!(self, Self::Compact)
+    }
+}
+
+/// OpenAI Responses API 透传：补齐 cache 字段后代理到上游。
+pub async fn passthrough(
+    client: &reqwest::Client,
+    ctx: &GatewayContext,
+    raw_body: serde_json::Value,
+    upstream_model: &str,
+    provider: &ProviderConfig,
+    log_context: Option<RequestLogContext>,
+) -> Result<Response<Body>, GatewayError> {
+    passthrough_with_tool_names(
+        client,
+        ctx,
+        raw_body,
+        upstream_model,
+        provider,
+        None,
+        log_context,
+    )
+    .await
+}
+
+pub async fn passthrough_with_tool_names(
+    client: &reqwest::Client,
+    ctx: &GatewayContext,
+    raw_body: serde_json::Value,
+    upstream_model: &str,
+    provider: &ProviderConfig,
+    grok_tool_names: Option<ToolNameMap>,
+    log_context: Option<RequestLogContext>,
+) -> Result<Response<Body>, GatewayError> {
+    passthrough_to_endpoint(
+        client,
+        ctx,
+        raw_body,
+        upstream_model,
+        provider,
+        grok_tool_names,
+        log_context,
+        ResponsesEndpoint::Responses,
+    )
+    .await
+}
+
+/// OpenAI Responses Compact API 透传。该接口始终返回 unary JSON。
+pub async fn passthrough_compact(
+    client: &reqwest::Client,
+    ctx: &GatewayContext,
+    raw_body: serde_json::Value,
+    upstream_model: &str,
+    provider: &ProviderConfig,
+    log_context: Option<RequestLogContext>,
+) -> Result<Response<Body>, GatewayError> {
+    passthrough_to_endpoint(
+        client,
+        ctx,
+        raw_body,
+        upstream_model,
+        provider,
+        None,
+        log_context,
+        ResponsesEndpoint::Compact,
+    )
+    .await
+}
+
+async fn passthrough_to_endpoint(
+    client: &reqwest::Client,
+    ctx: &GatewayContext,
+    mut raw_body: serde_json::Value,
+    upstream_model: &str,
+    provider: &ProviderConfig,
+    mut grok_tool_names: Option<ToolNameMap>,
+    log_context: Option<RequestLogContext>,
+    endpoint: ResponsesEndpoint,
+) -> Result<Response<Body>, GatewayError> {
+    if endpoint.is_compact()
+        && raw_body
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Err(GatewayError::bad_request(
+            "responses compact does not support streaming",
+        ));
+    }
+
+    if !endpoint.is_compact()
+        && provider.provider_type == ProviderType::GrokResponses
+        && grok_tool_names.is_none()
+    {
+        grok_tool_names = Some(ToolNameMap::default());
+    }
+
+    // Do not inject OpenAI cache controls into other vendors' native APIs.
+    if !matches!(
+        provider.provider_type,
+        ProviderType::DeepSeekResponses | ProviderType::KimiResponses
+    ) {
+        let existing_key = raw_body
+            .get("prompt_cache_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if existing_key.is_empty() {
+            raw_body["prompt_cache_key"] = json!(ctx.prompt_cache_key);
+        }
+
+        if !endpoint.is_compact()
+            && let Some(retention) = &provider.prompt_cache_retention
+            && raw_body.get("prompt_cache_retention").is_none()
+        {
+            raw_body["prompt_cache_retention"] = json!(retention);
+        }
+    }
+    raw_body["model"] = json!(resolve_deepseek_upstream_model(provider, upstream_model));
+    if provider.provider_type == ProviderType::KimiResponses {
+        normalize_kimi_web_search(&mut raw_body);
+    }
+    let encrypted_content_scope = EncryptedContentScope::for_provider(provider);
+    let encrypted_content_stats =
+        prepare_responses_request(&mut raw_body, &encrypted_content_scope);
+    if encrypted_content_stats.filtered > 0 || encrypted_content_stats.decoded > 0 {
+        debug!(
+            provider = %provider.name,
+            decoded = encrypted_content_stats.decoded,
+            filtered = encrypted_content_stats.filtered,
+            dropped_items = encrypted_content_stats.dropped_items,
+            "prepared scoped encrypted reasoning content for upstream"
+        );
+    }
+    let deepseek_tool_history = if !endpoint.is_compact() {
+        repair_deepseek_tool_history(&mut raw_body, provider)
+    } else {
+        DeepSeekToolHistoryStats::default()
+    };
+    if deepseek_tool_history.changed() {
+        debug!(
+            provider = %provider.name,
+            removed_calls = deepseek_tool_history.removed_calls,
+            downgraded_outputs = deepseek_tool_history.downgraded_outputs,
+            "repaired incomplete tool history for DeepSeek Responses"
+        );
+    }
+    let grok_compatibility = if endpoint.is_compact() {
+        GrokModelInputStats::default()
+    } else {
+        normalize_grok_reasoning_replay(&mut raw_body, provider);
+        normalize_grok_model_input_with_tool_names(
+            &mut raw_body,
+            provider,
+            grok_tool_names.as_mut(),
+        )
+    };
+    if grok_compatibility.changed() {
+        debug!(
+            provider = %provider.name,
+            custom_calls = grok_compatibility.custom_calls,
+            custom_outputs = grok_compatibility.custom_outputs,
+            structured_outputs = grok_compatibility.structured_outputs,
+            removed_phase_fields = grok_compatibility.removed_phase_fields,
+            namespaced_calls = grok_compatibility.namespaced_calls,
+            view_image_calls = grok_compatibility.view_image_calls,
+            "normalized Codex tool history for Grok ModelInput"
+        );
+    }
+
+    let is_stream = !endpoint.is_compact()
+        && raw_body
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+    let url = format!(
+        "{}{}",
+        provider_api_root(&provider.base_url),
+        endpoint.path()
+    );
+    let mut invalid_encrypted_content_retry = false;
+    let mut request_body_read_retry_count = 0usize;
+    let upstream_resp = loop {
+        // 3. 构建上游请求。密文恢复重试会使用清理后的 body 重建请求。
+        let req_builder = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {}", provider.api_key));
+        let req_builder =
+            apply_total_request_timeout(req_builder, provider.timeout_secs, is_stream)
+                .json(&raw_body);
+        let req_builder = apply_upstream_headers(req_builder, &ctx.upstream_headers);
+        let mut upstream_req = req_builder.build().map_err(|e| {
+            error!(error = %e, "build upstream request failed");
+            GatewayError::upstream(
+                StatusCode::BAD_GATEWAY,
+                format!("build upstream request: {e}"),
+            )
+        })?;
+        if endpoint.is_compact() {
+            upstream_req.headers_mut().insert(
+                HeaderName::from_static("accept"),
+                HeaderValue::from_static("application/json"),
+            );
+        }
+
+        if let Some(log_context) = &log_context {
+            let update = RequestLogUpdate {
+                upstream_request_headers_json: log_context
+                    .details_enabled
+                    .then(|| request_log::headers_to_json(upstream_req.headers()))
+                    .flatten(),
+                upstream_request_body_bytes: request_log::json_body_size_bytes(&raw_body),
+                upstream_request_json: log_context
+                    .details_enabled
+                    .then(|| serde_json::to_string(&raw_body).ok())
+                    .flatten(),
+                ..RequestLogUpdate::default()
+            };
+            if let Err(err) = log_context.store.update_record(log_context.log_id, &update) {
+                request_log::log_update_error(err);
+            }
+        }
+
+        debug!(
+            url = %url,
+            stream = is_stream,
+            encrypted_content_retry = invalid_encrypted_content_retry,
+            request_body_read_retry_count,
+            "proxying to openai responses endpoint"
+        );
+
+        let upstream_resp = if is_stream {
+            execute_stream_start(
+                client,
+                upstream_req,
+                provider.timeout_secs,
+                "upstream request failed",
+            )
+            .await?
+        } else {
+            execute_upstream_request(
+                client,
+                upstream_req,
+                provider.timeout_secs,
+                "upstream request failed",
+            )
+            .await?
+        };
+
+        if upstream_resp.status() == StatusCode::BAD_REQUEST {
+            let body_text = upstream_resp.text().await.unwrap_or_default();
+            if is_failed_to_read_request_body_error(StatusCode::BAD_REQUEST, &body_text)
+                && request_body_read_retry_count < UPSTREAM_REQUEST_BODY_READ_MAX_RETRIES
+            {
+                request_body_read_retry_count += 1;
+                warn!(
+                    provider = %provider.name,
+                    request_body_bytes = request_log::json_body_size_bytes(&raw_body),
+                    retry_count = request_body_read_retry_count,
+                    max_retries = UPSTREAM_REQUEST_BODY_READ_MAX_RETRIES,
+                    "upstream could not finish reading request body; retrying safely"
+                );
+                tokio::time::sleep(upstream_transport_retry_delay(
+                    request_body_read_retry_count,
+                ))
+                .await;
+                continue;
+            }
+            if !invalid_encrypted_content_retry
+                && is_invalid_encrypted_content_error(StatusCode::BAD_REQUEST, &body_text)
+            {
+                let cleanup = remove_all_responses_encrypted_content(&mut raw_body);
+                if cleanup.filtered > 0 {
+                    invalid_encrypted_content_retry = true;
+                    warn!(
+                        provider = %provider.name,
+                        filtered = cleanup.filtered,
+                        dropped_items = cleanup.dropped_items,
+                        "retrying once after upstream rejected legacy or stale encrypted content"
+                    );
+                    continue;
+                }
+            }
+            return Err(GatewayError::from_upstream_body(
+                StatusCode::BAD_REQUEST,
+                &provider.name,
+                &body_text,
+            ));
+        }
+
+        break upstream_resp;
+    };
+
+    let upstream_resp = ensure_success_response(&provider.name, upstream_resp).await?;
+
+    // 6. 流式：透传 SSE 流
+    if is_stream {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            HeaderName::from_static("cache-control"),
+            HeaderValue::from_static("no-cache"),
+        );
+        headers.insert(
+            HeaderName::from_static("connection"),
+            HeaderValue::from_static("keep-alive"),
+        );
+        copy_upstream_response_headers(upstream_resp.headers(), &mut headers);
+
+        let byte_stream = upstream_resp.bytes_stream().map(|result| {
+            result.map_err(|e| {
+                error!(error = %e, "upstream SSE stream error");
+                std::io::Error::new(std::io::ErrorKind::Other, e)
+            })
+        });
+        let byte_stream = prime_sse_stream(Box::pin(byte_stream), provider).await?;
+        let body = if let Some(log_context) = log_context {
+            let captured_upstream = UpstreamSseCaptureStream::new(byte_stream, log_context.clone());
+            let compat_stream = ResponsesCompatSseStream::with_compatibility(
+                Box::pin(captured_upstream),
+                encrypted_content_scope.clone(),
+                grok_tool_names.clone(),
+            );
+            Body::from_stream(ResponsesSseLogStream::new(
+                Box::pin(compat_stream),
+                log_context,
+            ))
+        } else {
+            Body::from_stream(ResponsesCompatSseStream::with_compatibility(
+                Box::pin(byte_stream),
+                encrypted_content_scope.clone(),
+                grok_tool_names.clone(),
+            ))
+        };
+        let mut response = Response::new(body);
+        *response.status_mut() = StatusCode::OK;
+        *response.headers_mut() = headers;
+        return Ok(response);
+    }
+
+    // 7. 非流式：透传 JSON 响应
+    let upstream_headers = upstream_resp.headers().clone();
+    let body_bytes = upstream_resp.bytes().await.map_err(|e| {
+        GatewayError::upstream(StatusCode::BAD_GATEWAY, format!("read upstream body: {e}"))
+    })?;
+    let (body_bytes, response_json) = normalize_json_body_with_scope_and_tool_names(
+        body_bytes,
+        Some(&encrypted_content_scope),
+        grok_tool_names.as_ref(),
+    );
+    if let Some(log_context) = &log_context {
+        let (status, usage, response_text) = response_json
+            .as_ref()
+            .map(|value| {
+                (
+                    request_log::status_from_response_value(value),
+                    request_log::usage_from_response_value(value),
+                    serde_json::to_string(value).ok(),
+                )
+            })
+            .unwrap_or_else(|| ("completed".to_string(), Default::default(), None));
+        let update = RequestLogUpdate {
+            status: Some(status),
+            usage: Some(usage),
+            latency_ms: Some(request_log::elapsed_ms(log_context.started_at)),
+            response_json: log_context
+                .details_enabled
+                .then_some(response_text)
+                .flatten(),
+            ..RequestLogUpdate::default()
+        };
+        if let Err(err) = log_context.store.update_record(log_context.log_id, &update) {
+            request_log::log_update_error(err);
+        }
+    }
+
+    let mut response = Response::new(Body::from(body_bytes));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("application/json"),
+    );
+    copy_upstream_response_headers(&upstream_headers, response.headers_mut());
+    Ok(response)
+}
+
+fn copy_upstream_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
+    for name in ["x-codex-turn-state", "x-request-id", "openai-model"] {
+        let name = HeaderName::from_static(name);
+        if let Some(value) = source.get(&name) {
+            target.insert(name, value.clone());
+        }
+    }
+}
+
+fn is_invalid_encrypted_content_error(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let normalized = body.to_ascii_lowercase();
+    normalized.contains("invalid_encrypted_content")
+        || (normalized.contains("encrypted content")
+            && (normalized.contains("could not be verified")
+                || normalized.contains("could not be decrypted")
+                || normalized.contains("could not be parsed")))
+}
+
+fn is_failed_to_read_request_body_error(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    value
+        .get("error")
+        .unwrap_or(&value)
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|message| {
+            message
+                .trim()
+                .eq_ignore_ascii_case("Failed to read request body")
+        })
+}
+
+fn normalize_grok_reasoning_replay(raw_body: &mut serde_json::Value, provider: &ProviderConfig) {
+    if provider.provider_type != ProviderType::GrokResponses {
+        return;
+    }
+
+    let Some(input) = raw_body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        if item
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|item_type| item_type != "reasoning")
+        {
+            continue;
+        }
+
+        if item.get("content").is_some_and(serde_json::Value::is_null) {
+            item.remove("content");
+        }
+
+        let has_encrypted_content = item
+            .get("encrypted_content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if !has_encrypted_content {
+            continue;
+        }
+
+        let has_item_id = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if has_item_id {
+            item.entry("status".to_string())
+                .or_insert_with(|| json!("completed"));
+        } else {
+            item.remove("encrypted_content");
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct GrokModelInputStats {
+    custom_calls: usize,
+    custom_outputs: usize,
+    structured_outputs: usize,
+    removed_phase_fields: usize,
+    namespaced_calls: usize,
+    view_image_calls: usize,
+    tool_search_calls: usize,
+    tool_search_outputs: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DeepSeekToolHistoryStats {
+    removed_calls: usize,
+    downgraded_outputs: usize,
+}
+
+fn repair_deepseek_tool_history(
+    raw_body: &mut serde_json::Value,
+    provider: &ProviderConfig,
+) -> DeepSeekToolHistoryStats {
+    let mut stats = DeepSeekToolHistoryStats::default();
+    if provider.provider_type != ProviderType::DeepSeekResponses {
+        return stats;
+    }
+
+    let Some(input) = raw_body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return stats;
+    };
+
+    let original = std::mem::take(input);
+    let mut repaired = Vec::with_capacity(original.len());
+    for (index, item) in original.iter().enumerate() {
+        let item_type = item
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if is_client_tool_call_type(item_type) {
+            if has_matching_tool_output_after(&original, index, item) {
+                repaired.push(item.clone());
+            } else {
+                stats.removed_calls += 1;
+            }
+        } else if is_client_tool_output_type(item_type) {
+            if has_matching_tool_call_before(&original, index, item) {
+                repaired.push(item.clone());
+            } else {
+                repaired.push(orphan_responses_tool_output_message(item));
+                stats.downgraded_outputs += 1;
+            }
+        } else {
+            repaired.push(item.clone());
+        }
+    }
+    *input = repaired;
+    stats
+}
+
+fn is_client_tool_call_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "function_call" | "local_shell_call" | "custom_tool_call" | "tool_search_call"
+    )
+}
+
+fn is_client_tool_output_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output"
+    )
+}
+
+fn has_matching_tool_output_after(
+    items: &[serde_json::Value],
+    call_index: usize,
+    call: &serde_json::Value,
+) -> bool {
+    items
+        .iter()
+        .skip(call_index.saturating_add(1))
+        .any(|output| tool_call_and_output_match(call, output))
+}
+
+fn has_matching_tool_call_before(
+    items: &[serde_json::Value],
+    output_index: usize,
+    output: &serde_json::Value,
+) -> bool {
+    items
+        .iter()
+        .take(output_index)
+        .any(|call| tool_call_and_output_match(call, output))
+}
+
+fn tool_call_and_output_match(call: &serde_json::Value, output: &serde_json::Value) -> bool {
+    let Some(call_id) = call
+        .get("call_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|call_id| !call_id.is_empty())
+    else {
+        return false;
+    };
+    if output.get("call_id").and_then(serde_json::Value::as_str) != Some(call_id) {
+        return false;
+    }
+
+    let call_type = call
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let output_type = output
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    matches!(
+        (call_type, output_type),
+        ("function_call" | "local_shell_call", "function_call_output")
+            | ("custom_tool_call", "custom_tool_call_output")
+            | ("tool_search_call", "tool_search_output")
+    )
+}
+
+fn orphan_responses_tool_output_message(output: &serde_json::Value) -> serde_json::Value {
+    let call_id = output
+        .get("call_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|call_id| !call_id.is_empty())
+        .unwrap_or("<missing>");
+    let value = output
+        .get("output")
+        .or_else(|| output.get("tools"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let text = match value {
+        serde_json::Value::String(text) => text,
+        other => serde_json::to_string(&other).unwrap_or_else(|_| other.to_string()),
+    };
+    json!({
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!("Function call output ({call_id}): {text}"),
+        }],
+    })
+}
+
+impl DeepSeekToolHistoryStats {
+    fn changed(&self) -> bool {
+        self.removed_calls > 0 || self.downgraded_outputs > 0
+    }
+}
+
+impl GrokModelInputStats {
+    fn changed(self) -> bool {
+        self.custom_calls > 0
+            || self.custom_outputs > 0
+            || self.structured_outputs > 0
+            || self.removed_phase_fields > 0
+            || self.namespaced_calls > 0
+            || self.view_image_calls > 0
+            || self.tool_search_calls > 0
+            || self.tool_search_outputs > 0
+    }
+}
+
+#[cfg(test)]
+fn normalize_grok_model_input(
+    raw_body: &mut serde_json::Value,
+    provider: &ProviderConfig,
+) -> GrokModelInputStats {
+    normalize_grok_model_input_with_tool_names(raw_body, provider, None)
+}
+
+fn normalize_grok_model_input_with_tool_names(
+    raw_body: &mut serde_json::Value,
+    provider: &ProviderConfig,
+    mut tool_names: Option<&mut ToolNameMap>,
+) -> GrokModelInputStats {
+    let mut stats = GrokModelInputStats::default();
+    if provider.provider_type != ProviderType::GrokResponses {
+        return stats;
+    }
+
+    let Some(input) = raw_body
+        .get_mut("input")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return stats;
+    };
+
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        let item_type = item
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        match item_type.as_str() {
+            "message" => {
+                if item.remove("phase").is_some() {
+                    stats.removed_phase_fields += 1;
+                }
+            }
+            "custom_tool_call" => {
+                let name = item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                if let (Some(name), Some(tool_names)) = (name.as_deref(), tool_names.as_deref_mut())
+                {
+                    item.insert("name".to_string(), json!(tool_names.encode_custom(name)));
+                }
+                let input = item
+                    .remove("input")
+                    .map(grok_custom_tool_input_text)
+                    .unwrap_or_default();
+                let argument_name = if name.as_deref() == Some(APPLY_PATCH_TOOL_NAME) {
+                    "patch"
+                } else {
+                    "input"
+                };
+                let arguments = serde_json::to_string(&json!({ (argument_name): input }))
+                    .unwrap_or_else(|_| format!("{{\"{argument_name}\":\"\"}}"));
+                item.insert("type".to_string(), json!("function_call"));
+                item.insert("arguments".to_string(), json!(arguments));
+                item.remove("status");
+                stats.custom_calls += 1;
+            }
+            "function_call" => {
+                let namespace = item
+                    .get("namespace")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                let name = item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                if let (Some(namespace), Some(name)) = (namespace.as_deref(), name.as_deref()) {
+                    if let Some(tool_names) = tool_names.as_deref_mut() {
+                        item.insert(
+                            "name".to_string(),
+                            json!(tool_names.encode_function(Some(namespace), name)),
+                        );
+                        item.remove("namespace");
+                        stats.namespaced_calls += 1;
+                    }
+                } else if namespace.is_none() && name.as_deref() == Some(VIEW_IMAGE_TOOL_NAME) {
+                    let encoded_name = tool_names
+                        .as_deref_mut()
+                        .map(|tool_names| {
+                            tool_names.encode_function_as(
+                                None,
+                                VIEW_IMAGE_TOOL_NAME,
+                                GROK_READ_FILE_TOOL_NAME,
+                            )
+                        })
+                        .unwrap_or_else(|| GROK_READ_FILE_TOOL_NAME.to_string());
+                    item.insert("name".to_string(), json!(encoded_name));
+                    if let Some(arguments) = item.remove("arguments") {
+                        item.insert(
+                            "arguments".to_string(),
+                            json!(grok_view_image_arguments_text(arguments)),
+                        );
+                    }
+                    stats.view_image_calls += 1;
+                }
+            }
+            "tool_search_call" => {
+                if let Some(tool_names) = tool_names.as_deref_mut() {
+                    item.insert("name".to_string(), json!(tool_names.encode_tool_search()));
+                } else {
+                    item.insert("name".to_string(), json!("tool_search"));
+                }
+                let arguments = item
+                    .remove("arguments")
+                    .map(grok_function_arguments_text)
+                    .unwrap_or_else(|| "{}".to_string());
+                item.insert("type".to_string(), json!("function_call"));
+                item.insert("arguments".to_string(), json!(arguments));
+                item.remove("execution");
+                item.remove("status");
+                stats.tool_search_calls += 1;
+            }
+            "custom_tool_call_output" => {
+                item.insert("type".to_string(), json!("function_call_output"));
+                stats.custom_outputs += 1;
+                if normalize_grok_tool_output(item) {
+                    stats.structured_outputs += 1;
+                }
+            }
+            "function_call_output" => {
+                if normalize_grok_tool_output(item) {
+                    stats.structured_outputs += 1;
+                }
+            }
+            "tool_search_output" => {
+                let output = serde_json::to_string(&json!({
+                    "status": item
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("completed"),
+                    "execution": item
+                        .get("execution")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("client"),
+                    "tools": item
+                        .remove("tools")
+                        .unwrap_or_else(|| json!([])),
+                }))
+                .unwrap_or_else(|_| r#"{"tools":[]}"#.to_string());
+                item.insert("type".to_string(), json!("function_call_output"));
+                item.insert("output".to_string(), json!(output));
+                item.remove("status");
+                item.remove("execution");
+                stats.tool_search_outputs += 1;
+            }
+            _ => {}
+        }
+    }
+
+    stats
+}
+
+fn grok_custom_tool_input_text(input: serde_json::Value) -> String {
+    match input {
+        serde_json::Value::String(input) => input,
+        other => serde_json::to_string(&other).unwrap_or_default(),
+    }
+}
+
+fn grok_function_arguments_text(arguments: serde_json::Value) -> String {
+    match arguments {
+        serde_json::Value::String(arguments) => arguments,
+        other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()),
+    }
+}
+
+fn grok_view_image_arguments_text(arguments: serde_json::Value) -> String {
+    match arguments {
+        serde_json::Value::String(arguments) => {
+            let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&arguments) else {
+                return arguments;
+            };
+            if !normalize_grok_view_image_argument_object(&mut parsed) {
+                return arguments;
+            }
+            serde_json::to_string(&parsed).unwrap_or(arguments)
+        }
+        mut arguments => {
+            normalize_grok_view_image_argument_object(&mut arguments);
+            serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string())
+        }
+    }
+}
+
+fn normalize_grok_view_image_argument_object(arguments: &mut serde_json::Value) -> bool {
+    let Some(arguments) = arguments.as_object_mut() else {
+        return false;
+    };
+    let mut changed = arguments.remove("detail").is_some();
+    if let Some(path) = arguments.remove("path") {
+        arguments.entry("target_file".to_string()).or_insert(path);
+        changed = true;
+    }
+    changed
+}
+
+fn normalize_grok_tool_output(item: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    let Some(output) = item.get_mut("output") else {
+        return false;
+    };
+    if output.is_string() {
+        return false;
+    }
+    let normalized = grok_tool_output_text(output);
+    *output = serde_json::Value::String(normalized);
+    true
+}
+
+fn grok_tool_output_text(output: &serde_json::Value) -> String {
+    let serde_json::Value::Array(items) = output else {
+        return serde_json::to_string(output).unwrap_or_default();
+    };
+    if items.is_empty() {
+        return String::new();
+    }
+
+    let mut text = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(item) = item.as_object() else {
+            return serde_json::to_string(output).unwrap_or_default();
+        };
+        let is_text = item
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|item_type| matches!(item_type, "input_text" | "output_text" | "text"));
+        if !is_text {
+            return serde_json::to_string(output).unwrap_or_default();
+        }
+        if let Some(value) = item.get("text").and_then(serde_json::Value::as_str) {
+            text.push(value);
+        }
+    }
+    text.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use axum::{
+        Json, Router,
+        body::{Bytes, to_bytes},
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode},
+        response::{IntoResponse, Response},
+        routing::post,
+    };
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use crate::ai_gateway::config::{ProviderConfig, ProviderType};
+    use crate::ai_gateway::context::GatewayContext;
+    use crate::ai_gateway::tool_names::{
+        GROK_READ_FILE_TOOL_NAME, ToolNameMap, VIEW_IMAGE_TOOL_NAME,
+    };
+
+    use super::{
+        inspect_priming_sse_chunk, is_failed_to_read_request_body_error,
+        is_immediate_failover_error, is_invalid_encrypted_content_error,
+        normalize_grok_model_input, normalize_grok_model_input_with_tool_names,
+        normalize_grok_reasoning_replay, normalize_kimi_web_search, passthrough,
+        passthrough_compact, repair_deepseek_tool_history, upstream_sse_failure,
+    };
+
+    #[test]
+    fn pre_output_overload_sse_event_is_a_failover_error() {
+        let provider = ProviderConfig {
+            name: "overloaded".to_string(),
+            ..Default::default()
+        };
+        let event = json!({
+            "type": "error",
+            "error": {
+                "type": "service_unavailable_error",
+                "code": "server_is_overloaded",
+                "message": "Our servers are currently overloaded. Please try again later."
+            }
+        });
+
+        let error = upstream_sse_failure(&event, &provider).expect("SSE error should be parsed");
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.provider.as_deref(), Some("overloaded"));
+        assert!(is_immediate_failover_error(
+            &error.message,
+            error.upstream_code.as_deref()
+        ));
+    }
+
+    #[test]
+    fn insufficient_balance_is_an_immediate_failover_error() {
+        assert!(is_immediate_failover_error("insufficient balance", None));
+        assert!(is_immediate_failover_error(
+            "Forbidden: insufficient balance",
+            None
+        ));
+    }
+
+    #[test]
+    fn priming_ignores_empty_keepalive_delta() {
+        let provider = ProviderConfig {
+            name: "keepalive".to_string(),
+            ..Default::default()
+        };
+        let mut line_buf = Vec::new();
+        let frame = Bytes::from_static(
+            br#"data: {"type":"response.output_text.delta","delta":"","SSE-Keep-Alive":true}
+
+"#,
+        );
+
+        assert!(
+            !inspect_priming_sse_chunk(&frame, &mut line_buf, &provider)
+                .expect("keepalive frame should not fail")
+        );
+    }
+
+    #[test]
+    fn priming_accepts_nonempty_response_delta() {
+        let provider = ProviderConfig {
+            name: "output".to_string(),
+            ..Default::default()
+        };
+        let mut line_buf = Vec::new();
+        let frame = Bytes::from_static(
+            br#"data: {"type":"response.function_call_arguments.delta","delta":"{"}
+
+"#,
+        );
+
+        assert!(
+            inspect_priming_sse_chunk(&frame, &mut line_buf, &provider)
+                .expect("real output frame should not fail")
+        );
+    }
+
+    struct RetryServerState {
+        attempts: AtomicUsize,
+        requests: mpsc::UnboundedSender<serde_json::Value>,
+    }
+
+    async fn invalid_encrypted_content_then_success(
+        State(state): State<Arc<RetryServerState>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        state
+            .requests
+            .send(body)
+            .expect("request capture receiver should stay open");
+        if state.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "code": "invalid_encrypted_content",
+                        "type": "invalid_request_error",
+                        "message": "The encrypted content could not be verified."
+                    }
+                })),
+            )
+                .into_response();
+        }
+        Json(json!({
+            "id": "resp_recovered",
+            "object": "response",
+            "output": [{
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": "fresh-openai-content"
+            }]
+        }))
+        .into_response()
+    }
+
+    async fn retry_server() -> (
+        String,
+        mpsc::UnboundedReceiver<serde_json::Value>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let state = Arc::new(RetryServerState {
+            attempts: AtomicUsize::new(0),
+            requests: sender,
+        });
+        let app = Router::new()
+            .route(
+                "/v1/responses",
+                post(invalid_encrypted_content_then_success),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind retry server");
+        let address = listener.local_addr().expect("retry server address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve retry endpoint");
+        });
+        (format!("http://{address}/v1"), receiver, task)
+    }
+
+    async fn failed_request_body_then_success(
+        State(state): State<Arc<RetryServerState>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        state
+            .requests
+            .send(body)
+            .expect("request capture receiver should stay open");
+        if state.attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": "Failed to read request body",
+                        "type": "invalid_request_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+        Json(json!({
+            "id": "resp_upload_recovered",
+            "object": "response",
+            "status": "completed",
+            "output": []
+        }))
+        .into_response()
+    }
+
+    async fn request_body_retry_server() -> (
+        String,
+        mpsc::UnboundedReceiver<serde_json::Value>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let state = Arc::new(RetryServerState {
+            attempts: AtomicUsize::new(0),
+            requests: sender,
+        });
+        let app = Router::new()
+            .route("/v1/responses", post(failed_request_body_then_success))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind request body retry server");
+        let address = listener.local_addr().expect("request body retry address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve request body retry endpoint");
+        });
+        (format!("http://{address}/v1"), receiver, task)
+    }
+
+    async fn capture_success(
+        State(requests): State<mpsc::UnboundedSender<serde_json::Value>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        requests
+            .send(body)
+            .expect("request capture receiver should stay open");
+        let mut response = Json(json!({
+            "id": "resp_ok",
+            "object": "response",
+            "status": "completed",
+            "output": []
+        }))
+        .into_response();
+        response.headers_mut().insert(
+            "x-codex-turn-state",
+            HeaderValue::from_static("response-state"),
+        );
+        response
+    }
+
+    async fn capture_server() -> (
+        String,
+        mpsc::UnboundedReceiver<serde_json::Value>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/v1/responses", post(capture_success))
+            .with_state(sender);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind capture server");
+        let address = listener.local_addr().expect("capture server address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve capture endpoint");
+        });
+        (format!("http://{address}/v1"), receiver, task)
+    }
+
+    async fn capture_compact_success(
+        State(requests): State<mpsc::UnboundedSender<(HeaderMap, serde_json::Value)>>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        requests
+            .send((headers, body))
+            .expect("request capture receiver should stay open");
+        let mut response = Json(json!({
+            "id": "cmp_ok",
+            "object": "response.compaction",
+            "created_at": 1_700_000_000,
+            "output": [{
+                "type": "compaction",
+                "encrypted_content": "opaque-compact"
+            }],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "total_tokens": 110
+            }
+        }))
+        .into_response();
+        response.headers_mut().insert(
+            "x-codex-turn-state",
+            HeaderValue::from_static("compact-state"),
+        );
+        response
+    }
+
+    async fn compact_capture_server() -> (
+        String,
+        mpsc::UnboundedReceiver<(HeaderMap, serde_json::Value)>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/v1/responses/compact", post(capture_compact_success))
+            .with_state(sender);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind compact capture server");
+        let address = listener
+            .local_addr()
+            .expect("compact capture server address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve compact capture endpoint");
+        });
+        (format!("http://{address}/v1"), receiver, task)
+    }
+
+    fn grok_provider() -> ProviderConfig {
+        ProviderConfig {
+            name: "grok".to_string(),
+            provider_type: ProviderType::GrokResponses,
+            base_url: "https://api.x.ai/v1".to_string(),
+            ..ProviderConfig::default()
+        }
+    }
+
+    fn openai_responses_provider() -> ProviderConfig {
+        ProviderConfig {
+            name: "openai-compatible".to_string(),
+            provider_type: ProviderType::OpenAiResponses,
+            base_url: "https://api.x.ai/v1".to_string(),
+            ..ProviderConfig::default()
+        }
+    }
+
+    fn deepseek_responses_provider() -> ProviderConfig {
+        ProviderConfig {
+            name: "deepseek-responses".to_string(),
+            provider_type: ProviderType::DeepSeekResponses,
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            ..ProviderConfig::default()
+        }
+    }
+
+    #[test]
+    fn xai_reasoning_replay_without_item_id_drops_encrypted_content() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "content": null,
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                    "encrypted_content": "opaque-blob"
+                }
+            ]
+        });
+
+        normalize_grok_reasoning_replay(&mut body, &grok_provider());
+
+        let reasoning = &body["input"][0];
+        assert!(reasoning.get("encrypted_content").is_none());
+        assert!(reasoning.get("content").is_none());
+        assert!(reasoning.get("status").is_none());
+        assert_eq!(reasoning["summary"][0]["text"], "thinking");
+    }
+
+    #[test]
+    fn xai_reasoning_replay_with_item_id_keeps_blob_and_adds_status() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_123",
+                    "content": null,
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                    "encrypted_content": "opaque-blob"
+                }
+            ]
+        });
+
+        normalize_grok_reasoning_replay(&mut body, &grok_provider());
+
+        let reasoning = &body["input"][0];
+        assert_eq!(reasoning["encrypted_content"], "opaque-blob");
+        assert_eq!(reasoning["status"], "completed");
+        assert!(reasoning.get("content").is_none());
+    }
+
+    #[test]
+    fn grok_model_input_normalizes_gpt_5_6_custom_tool_history() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "running"}]
+                },
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_exec",
+                    "name": "exec",
+                    "status": "completed",
+                    "input": "Get-ChildItem"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_exec",
+                    "output": [
+                        {"type": "input_text", "text": "Wall time: 0.1 seconds"},
+                        {"type": "input_text", "text": "file.txt"}
+                    ]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_wait",
+                    "output": [
+                        {"type": "output_text", "text": "done"}
+                    ]
+                }
+            ]
+        });
+
+        let stats = normalize_grok_model_input(&mut body, &grok_provider());
+
+        assert_eq!(stats.custom_calls, 1);
+        assert_eq!(stats.custom_outputs, 1);
+        assert_eq!(stats.structured_outputs, 2);
+        assert_eq!(stats.removed_phase_fields, 1);
+        assert!(body["input"][0].get("phase").is_none());
+
+        let call = &body["input"][1];
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["call_id"], "call_exec");
+        assert_eq!(call["name"], "exec");
+        assert!(call.get("input").is_none());
+        assert!(call.get("status").is_none());
+        let arguments: serde_json::Value =
+            serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"input": "Get-ChildItem"}));
+
+        let custom_output = &body["input"][2];
+        assert_eq!(custom_output["type"], "function_call_output");
+        assert_eq!(custom_output["output"], "Wall time: 0.1 seconds\nfile.txt");
+        assert_eq!(body["input"][3]["output"], "done");
+    }
+
+    #[test]
+    fn grok_model_input_serializes_non_text_tool_output_as_string() {
+        let mut body = json!({
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_image",
+                "output": [{
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,AAAA"
+                }]
+            }]
+        });
+
+        let stats = normalize_grok_model_input(&mut body, &grok_provider());
+
+        assert_eq!(stats.structured_outputs, 1);
+        let output = body["input"][0]["output"].as_str().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(output).unwrap(),
+            json!([{
+                "type": "input_image",
+                "image_url": "data:image/png;base64,AAAA"
+            }])
+        );
+    }
+
+    #[test]
+    fn grok_model_input_reencodes_custom_and_namespace_history() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_exec",
+                    "name": "exec",
+                    "input": "pwd"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_open",
+                    "namespace": "browser",
+                    "name": "open",
+                    "arguments": "{\"url\":\"https://example.com\"}"
+                }
+            ]
+        });
+        let mut tool_names = ToolNameMap::default();
+        tool_names.encode_custom("exec");
+        let browser_name = tool_names.encode_function(Some("browser"), "open");
+
+        let stats = normalize_grok_model_input_with_tool_names(
+            &mut body,
+            &grok_provider(),
+            Some(&mut tool_names),
+        );
+
+        assert_eq!(stats.custom_calls, 1);
+        assert_eq!(stats.namespaced_calls, 1);
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][0]["name"], "exec");
+        assert_eq!(body["input"][1]["name"], browser_name);
+        assert!(body["input"][1].get("namespace").is_none());
+    }
+
+    #[test]
+    fn grok_model_input_maps_view_image_history_to_read_file() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_image_string",
+                    "name": "view_image",
+                    "arguments": "{\"path\":\"C:/tmp/one.png\",\"detail\":\"original\"}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_image_object",
+                    "name": "view_image",
+                    "arguments": {"path":"C:/tmp/two.png","detail":"high"}
+                }
+            ]
+        });
+        let mut tool_names = ToolNameMap::default();
+        tool_names.encode_function_as(None, VIEW_IMAGE_TOOL_NAME, GROK_READ_FILE_TOOL_NAME);
+
+        let stats = normalize_grok_model_input_with_tool_names(
+            &mut body,
+            &grok_provider(),
+            Some(&mut tool_names),
+        );
+
+        assert_eq!(stats.view_image_calls, 2);
+        for (index, expected_path) in ["C:/tmp/one.png", "C:/tmp/two.png"].iter().enumerate() {
+            let call = &body["input"][index];
+            assert_eq!(call["name"], GROK_READ_FILE_TOOL_NAME);
+            let arguments: serde_json::Value =
+                serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(arguments["target_file"], *expected_path);
+            assert!(arguments.get("path").is_none());
+            assert!(arguments.get("detail").is_none());
+        }
+    }
+
+    #[test]
+    fn non_grok_model_input_keeps_view_image_history_unchanged() {
+        let mut body = json!({
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_image",
+                "name": "view_image",
+                "arguments": "{\"path\":\"C:/tmp/image.png\"}"
+            }]
+        });
+        let original = body.clone();
+
+        let stats = normalize_grok_model_input(&mut body, &openai_responses_provider());
+
+        assert!(!stats.changed());
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn grok_model_input_reencodes_tool_search_history() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_search",
+                    "status": "completed",
+                    "execution": "client",
+                    "arguments": {"query": "repo tools"}
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_search",
+                    "status": "completed",
+                    "execution": "client",
+                    "tools": [
+                        {"type":"namespace","name":"fs","tools":[
+                            {"type":"function","name":"read_file"}
+                        ]}
+                    ]
+                }
+            ]
+        });
+        let mut tool_names = ToolNameMap::default();
+        let tool_search_name = tool_names.encode_tool_search();
+
+        let stats = normalize_grok_model_input_with_tool_names(
+            &mut body,
+            &grok_provider(),
+            Some(&mut tool_names),
+        );
+
+        assert_eq!(stats.tool_search_calls, 1);
+        assert_eq!(stats.tool_search_outputs, 1);
+
+        let call = &body["input"][0];
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["name"], tool_search_name);
+        assert!(call.get("execution").is_none());
+        assert!(call.get("status").is_none());
+        let arguments: serde_json::Value =
+            serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"query": "repo tools"}));
+
+        let output = &body["input"][1];
+        assert_eq!(output["type"], "function_call_output");
+        assert!(output.get("execution").is_none());
+        assert!(output.get("status").is_none());
+        assert!(output.get("tools").is_none());
+        let output_payload: serde_json::Value =
+            serde_json::from_str(output["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output_payload["status"], "completed");
+        assert_eq!(output_payload["execution"], "client");
+        assert_eq!(output_payload["tools"][0]["name"], "fs");
+    }
+
+    #[test]
+    fn grok_model_input_uses_grok_build_patch_argument_for_apply_patch_history() {
+        let patch = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch";
+        let mut body = json!({
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "call_patch",
+                "name": "apply_patch",
+                "input": patch
+            }]
+        });
+        let mut tool_names = ToolNameMap::default();
+        tool_names.encode_custom("apply_patch");
+
+        let stats = normalize_grok_model_input_with_tool_names(
+            &mut body,
+            &grok_provider(),
+            Some(&mut tool_names),
+        );
+
+        assert_eq!(stats.custom_calls, 1);
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][0]["name"], "apply_patch");
+        let arguments: serde_json::Value =
+            serde_json::from_str(body["input"][0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({"patch": patch}));
+    }
+
+    #[test]
+    fn openai_responses_provider_keeps_custom_tool_history_unchanged() {
+        let mut body = json!({
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "call_exec",
+                "name": "exec",
+                "status": "completed",
+                "input": "pwd"
+            }]
+        });
+        let original = body.clone();
+
+        let stats = normalize_grok_model_input(&mut body, &openai_responses_provider());
+
+        assert!(!stats.changed());
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn deepseek_responses_repairs_incomplete_tool_history() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_function",
+                    "name": "shell_command",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_function",
+                    "output": "ok"
+                },
+                {
+                    "type": "local_shell_call",
+                    "call_id": "call_local_shell",
+                    "action": {"type": "exec", "command": ["pwd"]}
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_local_shell",
+                    "output": "D:/workspace"
+                },
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_custom",
+                    "output": "Done!"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_missing_output",
+                    "name": "shell_command",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_missing_search_output",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_missing_call",
+                    "output": "preserve this result"
+                }
+            ]
+        });
+
+        let stats = repair_deepseek_tool_history(&mut body, &deepseek_responses_provider());
+
+        assert_eq!(stats.removed_calls, 2);
+        assert_eq!(stats.downgraded_outputs, 1);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 7);
+        assert!(input.iter().all(|item| {
+            item.get("call_id").and_then(serde_json::Value::as_str) != Some("call_missing_output")
+        }));
+        assert!(input.iter().all(|item| {
+            item.get("call_id").and_then(serde_json::Value::as_str)
+                != Some("call_missing_search_output")
+        }));
+        assert_eq!(input[6]["type"], "message");
+        assert_eq!(input[6]["role"], "user");
+        assert_eq!(
+            input[6]["content"][0]["text"],
+            "Function call output (call_missing_call): preserve this result"
+        );
+    }
+
+    #[test]
+    fn deepseek_responses_does_not_match_output_before_call() {
+        let mut body = json!({
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_out_of_order",
+                    "output": "too early"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_out_of_order",
+                    "name": "shell_command",
+                    "arguments": "{}"
+                }
+            ]
+        });
+
+        let stats = repair_deepseek_tool_history(&mut body, &deepseek_responses_provider());
+
+        assert_eq!(stats.removed_calls, 1);
+        assert_eq!(stats.downgraded_outputs, 1);
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][0]["type"], "message");
+    }
+
+    #[test]
+    fn openai_responses_does_not_repair_tool_history() {
+        let mut body = json!({
+            "input": [{
+                "type": "function_call",
+                "call_id": "call_without_output",
+                "name": "shell_command",
+                "arguments": "{}"
+            }]
+        });
+        let original = body.clone();
+
+        let stats = repair_deepseek_tool_history(&mut body, &openai_responses_provider());
+
+        assert!(!stats.changed());
+        assert_eq!(body, original);
+    }
+
+    #[tokio::test]
+    async fn grok_passthrough_sends_normalized_model_input() {
+        let (base_url, mut requests, server) = capture_server().await;
+        let provider = ProviderConfig {
+            name: "grok".to_string(),
+            provider_type: ProviderType::GrokResponses,
+            base_url,
+            api_key: "secret".to_string(),
+            timeout_secs: 10,
+            ..ProviderConfig::default()
+        };
+        let client = reqwest::Client::new();
+        let context = GatewayContext::extract(&HeaderMap::new(), Some("grok-history-session"));
+        let request = json!({
+            "model": "grok-4.6",
+            "stream": false,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "running"}]
+                },
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_exec",
+                    "name": "exec",
+                    "status": "completed",
+                    "input": "Get-ChildItem"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_exec",
+                    "output": [
+                        {"type": "input_text", "text": "Wall time: 0.1 seconds"},
+                        {"type": "input_text", "text": "file.txt"}
+                    ]
+                }
+            ]
+        });
+
+        let response = passthrough(&client, &context, request, "grok-4.6", &provider, None)
+            .await
+            .expect("Grok history normalization should reach upstream");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-codex-turn-state").unwrap(),
+            "response-state"
+        );
+
+        let upstream = requests.recv().await.expect("captured upstream request");
+        assert!(upstream["input"][0].get("phase").is_none());
+        assert_eq!(upstream["input"][1]["type"], "function_call");
+        assert_eq!(upstream["input"][2]["type"], "function_call_output");
+        assert_eq!(
+            upstream["input"][2]["output"],
+            "Wall time: 0.1 seconds\nfile.txt"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn deepseek_responses_uses_native_endpoint_without_injected_cache_fields() {
+        let (base_url, mut requests, server) = capture_server().await;
+        let provider = ProviderConfig {
+            name: "deepseek-responses".to_string(),
+            provider_type: ProviderType::DeepSeekResponses,
+            base_url,
+            api_key: "secret".to_string(),
+            prompt_cache_retention: Some("24h".to_string()),
+            timeout_secs: 10,
+            ..ProviderConfig::default()
+        };
+        let client = reqwest::Client::new();
+        let context = GatewayContext::extract(&HeaderMap::new(), Some("deepseek-session"));
+        let request = json!({
+            "model": "deepseek-client-alias",
+            "stream": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }],
+            "tools": [
+                {"type": "web_search", "search_context_size": "medium"},
+                {"type": "custom", "name": "apply_patch"}
+            ]
+        });
+
+        let response = passthrough(
+            &client,
+            &context,
+            request,
+            "deepseek-v4-flash",
+            &provider,
+            None,
+        )
+        .await
+        .expect("DeepSeek Responses request should reach the native endpoint");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let upstream = requests.recv().await.expect("captured upstream request");
+        assert_eq!(upstream["model"], "deepseek-v4-flash-vision-exp");
+        assert!(upstream.get("prompt_cache_key").is_none());
+        assert!(upstream.get("prompt_cache_retention").is_none());
+        assert_eq!(upstream["tools"][0]["type"], "web_search");
+        assert_eq!(upstream["tools"][1]["type"], "custom");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn kimi_responses_preserves_native_requests_and_json_or_sse_responses() {
+        for (prefix, stream) in [("", false), ("/coding", true), ("/third-party", false)] {
+            let native_output = json!([
+                {"id":"ws_kimi", "type":"web_search_call", "status":"completed",
+                 "action":{"type":"search", "query":"Kimi", "sources":[{"type":"url", "url":"https://kimi.com", "title":"Kimi"}]}},
+                {"id":"rs_kimi", "type":"reasoning", "summary":[], "encrypted_content":"native-kimi-state"},
+                {"id":"ct_kimi", "type":"custom_tool_call", "call_id":"patch_2", "name":"apply_patch", "input":"*** Begin Patch\n*** End Patch"}
+            ]);
+            let native_response = json!({
+                "id":"resp_kimi", "object":"response", "model":"k3", "status":"completed",
+                "output": native_output,
+                "usage":{"input_tokens":100, "input_tokens_details":{"cached_tokens":60}, "output_tokens":20, "total_tokens":120}
+            });
+            let wire_response = native_response.clone();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let app = Router::new().route(
+                &format!("{prefix}/v1/responses"),
+                post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let sender = sender.clone();
+                    let response = wire_response.clone();
+                    async move {
+                        sender.send((headers, body)).unwrap();
+                        if stream {
+                            let item_event = json!({"type":"response.output_item.done", "output_index":1, "item":response["output"][1]});
+                            let completed = json!({"type":"response.completed", "response":response});
+                            ([ ("content-type", "text/event-stream") ],
+                             format!("event: response.output_item.done\ndata: {item_event}\n\nevent: response.completed\ndata: {completed}\n\n")).into_response()
+                        } else {
+                            Json(response).into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = ProviderConfig {
+                name: "kimi-test".into(),
+                provider_type: ProviderType::KimiResponses,
+                base_url: format!("http://{address}{prefix}/v1/"),
+                api_key: "kimi-secret".into(),
+                prompt_cache_retention: Some("24h".into()),
+                timeout_secs: 10,
+                ..Default::default()
+            };
+            let request = json!({
+                "model":"kimi-k3", "stream":stream,
+                "reasoning":{"effort":"max", "summary":"none"},
+                "input":[
+                    {"type":"reasoning", "id":"rs_old", "summary":[], "encrypted_content":"native-history"},
+                    {"type":"custom_tool_call", "call_id":"patch_1", "name":"apply_patch", "input":"*** Begin Patch\n*** End Patch"},
+                    {"type":"custom_tool_call_output", "call_id":"patch_1", "output":"ok"},
+                    {"type":"function_call", "call_id":"read_1", "namespace":"fs", "name":"read", "arguments":"{}"},
+                    {"type":"function_call_output", "call_id":"read_1", "output":[{"type":"input_text", "text":"image"}, {"type":"input_image", "image_url":"data:image/png;base64,AA=="}]},
+                    {"type":"additional_tools", "role":"developer", "tools":[{"type":"function", "name":"wait", "parameters":{"type":"object"}}]},
+                    {"type":"message", "role":"user", "content":"continue"}
+                ],
+                "tools":[
+                    {"type":"web_search", "search_context_size":"medium", "filters":{"allowed_domains":["kimi.com"]}},
+                    {"type":"custom", "name":"apply_patch", "format":{"type":"text"}},
+                    {"type":"namespace", "name":"fs", "tools":[{"type":"function", "name":"read", "parameters":{"type":"object"}}]}
+                ],
+                "future_field":{"keep":true}
+            });
+            let mut expected = request.clone();
+            expected["model"] = json!("k3");
+            expected["tools"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("search_context_size");
+            let context = GatewayContext::extract(&HeaderMap::new(), Some("kimi-session"));
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let response = passthrough(&client, &context, request, "k3", &provider, None)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let (headers, upstream) = receiver.recv().await.unwrap();
+            assert_eq!(headers["authorization"], "Bearer kimi-secret");
+            assert_eq!(upstream, expected);
+            assert!(upstream.get("prompt_cache_key").is_none());
+            assert!(upstream.get("prompt_cache_retention").is_none());
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            if stream {
+                let text = String::from_utf8(bytes.to_vec()).unwrap();
+                let events: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|data| serde_json::from_str(data).ok())
+                    .collect();
+                let done = events
+                    .iter()
+                    .find(|event| event["type"] == "response.completed")
+                    .unwrap();
+                assert_eq!(done["response"]["output"], native_output);
+                assert_eq!(done["response"]["usage"], native_response["usage"]);
+                assert_eq!(events[0]["item"]["encrypted_content"], "native-kimi-state");
+            } else {
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["output"], native_output);
+                assert_eq!(body["usage"], native_response["usage"]);
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[test]
+    fn kimi_search_cleanup_only_changes_tool_declarations() {
+        let mut body = json!({
+            "tools":[
+                {"type":"web_search", "search_context_size":"high", "future_option":true},
+                {"type":"function", "name":"example", "parameters":{"type":"object", "properties":{"tools":{"default":[{"type":"web_search", "search_context_size":"user-data"}]}}}}
+            ],
+            "input":[
+                {"type":"additional_tools", "tools":[{"type":"namespace", "name":"browser", "tools":[{"type":"web_search", "search_context_size":"low"}]}]},
+                {"type":"function_call_output", "call_id":"call1", "output":{"tools":[{"type":"web_search", "search_context_size":"user-data"}]}}
+            ],
+            "prompt_cache_key":"explicit-key", "prompt_cache_retention":"explicit-value"
+        });
+        let original = body.clone();
+        normalize_kimi_web_search(&mut body);
+        assert_eq!(
+            body["tools"][0],
+            json!({"type":"web_search", "future_option":true})
+        );
+        assert_eq!(
+            body["input"][0]["tools"][0]["tools"][0],
+            json!({"type":"web_search"})
+        );
+        assert_eq!(body["tools"][1], original["tools"][1]);
+        assert_eq!(body["input"][1], original["input"][1]);
+        assert_eq!(body["prompt_cache_key"], "explicit-key");
+        assert_eq!(body["prompt_cache_retention"], "explicit-value");
+        let once = body.clone();
+        normalize_kimi_web_search(&mut body);
+        assert_eq!(body, once);
+    }
+
+    #[tokio::test]
+    async fn compact_passthrough_uses_unary_compact_endpoint() {
+        let (base_url, mut requests, server) = compact_capture_server().await;
+        let provider = ProviderConfig {
+            name: "openai".to_string(),
+            provider_type: ProviderType::OpenAiResponses,
+            base_url,
+            api_key: "secret".to_string(),
+            prompt_cache_retention: Some("24h".to_string()),
+            timeout_secs: 10,
+            ..ProviderConfig::default()
+        };
+        let client = reqwest::Client::new();
+        let mut client_headers = HeaderMap::new();
+        client_headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+        let context = GatewayContext::extract(&client_headers, Some("compact-cache-key"));
+        let request = json!({
+            "model": "gpt-client",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "compact this"}]
+            }],
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}],
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "service_tier": "priority",
+            "text": {"verbosity": "low"},
+            "future_field": {"preserved": true}
+        });
+
+        let response =
+            passthrough_compact(&client, &context, request, "gpt-upstream", &provider, None)
+                .await
+                .expect("compact request should reach upstream");
+
+        let (headers, upstream) = requests.recv().await.expect("captured compact request");
+        assert_eq!(headers.get("accept").unwrap(), "application/json");
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
+        assert_eq!(upstream["model"], "gpt-upstream");
+        assert_eq!(upstream["prompt_cache_key"], "compact-cache-key");
+        assert!(upstream.get("prompt_cache_retention").is_none());
+        assert_eq!(upstream["tools"][0]["name"], "lookup");
+        assert_eq!(upstream["parallel_tool_calls"], true);
+        assert_eq!(upstream["service_tier"], "priority");
+        assert_eq!(upstream["future_field"]["preserved"], true);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-codex-turn-state").unwrap(),
+            "compact-state"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read compact response");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("compact response JSON");
+        assert_eq!(body["object"], "response.compaction");
+        assert_eq!(body["output"][0]["encrypted_content"], "opaque-compact");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compact_passthrough_rejects_streaming() {
+        let provider = openai_responses_provider();
+        let client = reqwest::Client::new();
+        let context = GatewayContext::extract(&HeaderMap::new(), Some("compact-cache-key"));
+        let result = passthrough_compact(
+            &client,
+            &context,
+            json!({"model": "gpt-5", "stream": true, "input": []}),
+            "gpt-5",
+            &provider,
+            None,
+        )
+        .await;
+
+        let error = match result {
+            Ok(_) => panic!("streaming compact request should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("does not support streaming"));
+    }
+
+    #[test]
+    fn openai_responses_provider_does_not_apply_grok_reasoning_replay_compatibility() {
+        let mut body = json!({
+            "model": "grok-4.6",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "content": null,
+                    "summary": [{"type": "summary_text", "text": "thinking"}],
+                    "encrypted_content": "opaque-blob"
+                }
+            ]
+        });
+
+        normalize_grok_reasoning_replay(&mut body, &openai_responses_provider());
+
+        let reasoning = &body["input"][0];
+        assert_eq!(reasoning["encrypted_content"], "opaque-blob");
+        assert!(
+            reasoning
+                .get("content")
+                .is_some_and(|value| value.is_null())
+        );
+        assert!(reasoning.get("status").is_none());
+    }
+
+    #[test]
+    fn recognizes_direct_and_wrapped_invalid_encrypted_content_errors() {
+        assert!(is_invalid_encrypted_content_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":"invalid_encrypted_content","message":"bad blob"}}"#,
+        ));
+        assert!(is_invalid_encrypted_content_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":"upstream_error","message":"The encrypted content p3HD could not be verified. Reason: Encrypted content could not be decrypted or parsed."}}"#,
+        ));
+        assert!(!is_invalid_encrypted_content_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"Unknown parameter"}}"#,
+        ));
+        assert!(!is_invalid_encrypted_content_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":{"code":"invalid_encrypted_content"}}"#,
+        ));
+    }
+
+    #[test]
+    fn recognizes_only_explicit_failed_request_body_errors() {
+        assert!(is_failed_to_read_request_body_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"Failed to read request body","type":"invalid_request_error"}}"#,
+        ));
+        assert!(is_failed_to_read_request_body_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"message":"failed to read request body"}"#,
+        ));
+        assert!(!is_failed_to_read_request_body_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"Failed to parse request body"}}"#,
+        ));
+        assert!(!is_failed_to_read_request_body_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":{"message":"Failed to read request body"}}"#,
+        ));
+    }
+
+    #[tokio::test]
+    async fn retries_failed_request_body_response_without_changing_payload() {
+        let (base_url, mut requests, server) = request_body_retry_server().await;
+        let provider = ProviderConfig {
+            name: "sub2api".to_string(),
+            provider_type: ProviderType::OpenAiResponses,
+            base_url,
+            api_key: "secret".to_string(),
+            timeout_secs: 10,
+            ..ProviderConfig::default()
+        };
+        let client = reqwest::Client::new();
+        let context = GatewayContext::extract(&HeaderMap::new(), Some("upload-retry-session"));
+        let request = json!({
+            "model": "gpt-5.6-sol",
+            "stream": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "continue"}]
+            }]
+        });
+
+        let response = passthrough(
+            &client,
+            &context,
+            request.clone(),
+            "gpt-5.6-sol",
+            &provider,
+            None,
+        )
+        .await
+        .expect("request body retry should recover");
+
+        let first = requests.recv().await.expect("first request");
+        let second = requests.recv().await.expect("second request");
+        let third = requests.recv().await.expect("third request");
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+        assert_eq!(third["input"], request["input"]);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read recovered response");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+        assert_eq!(body["id"], "resp_upload_recovered");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn retries_once_without_stale_encrypted_content_and_preserves_response() {
+        let (base_url, mut requests, server) = retry_server().await;
+        let provider = ProviderConfig {
+            name: "openai".to_string(),
+            provider_type: ProviderType::OpenAiResponses,
+            base_url,
+            api_key: "secret".to_string(),
+            timeout_secs: 10,
+            ..ProviderConfig::default()
+        };
+        let client = reqwest::Client::new();
+        let context = GatewayContext::extract(&HeaderMap::new(), Some("retry-session"));
+        let request = json!({
+            "model": "gpt-5.6-sol",
+            "stream": false,
+            "input": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "legacy-grok-content"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }
+            ]
+        });
+
+        let response = passthrough(&client, &context, request, "gpt-5.6-sol", &provider, None)
+            .await
+            .expect("retry should recover");
+
+        let first = requests.recv().await.expect("first request");
+        let second = requests.recv().await.expect("retry request");
+        assert_eq!(
+            first["input"][0]["encrypted_content"],
+            "legacy-grok-content"
+        );
+        assert_eq!(second["input"].as_array().unwrap().len(), 1);
+        assert_eq!(second["input"][0]["type"], "message");
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read recovered response");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+        assert_eq!(
+            body["output"][0]["encrypted_content"],
+            "fresh-openai-content"
+        );
+
+        server.abort();
+    }
+}
