@@ -124,14 +124,12 @@ jobs:
 
           Copy-Item "target\release\chatroute.exe" (Join-Path $zipDist "ChatRoute.exe")
           Copy-Item "README.md" $zipDist
-          Copy-Item "README.en.md" $zipDist
           if (Test-Path "config.example.toml") {
             Copy-Item "config.example.toml" $zipDist
           }
 
           Copy-Item "target\release\chatroute.exe" (Join-Path $msiSource "ChatRoute.exe")
           Copy-Item "README.md" $msiSource
-          Copy-Item "README.en.md" $msiSource
           Copy-Item "config.example.toml" $msiSource
           Copy-Item "packaging\icons\AppIcon.ico" $msiSource
 
