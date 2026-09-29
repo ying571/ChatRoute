@@ -44,9 +44,9 @@ For Codex App and the VS Code extension, the usual flow is: download the app -> 
 
 ### 1. Install
 
-Download `ChatRoute.dmg` from GitHub Releases, drag it to Applications, then open it. On Windows, run `chatroute.exe` from the release package. On Linux, download `ChatRoute Linux x86_64.AppImage`, make it executable, then double-click it.
+Download `ChatRoute.dmg` from GitHub Releases, drag it to Applications, then open it. On Windows, run `chatroute.exe` from the release package. On Linux, download `ChatRoute.Linux.x86_64.AppImage`, make it executable, then double-click it.
 
-If macOS warns that the app was downloaded from the internet, confirm the system prompt. If your Linux desktop does not mark the AppImage as executable automatically, run `chmod +x "ChatRoute Linux x86_64.AppImage"` once. The app does not install startup items and does not run in the background automatically.
+If macOS warns that the app was downloaded from the internet, confirm the system prompt. If your Linux desktop does not mark the AppImage as executable automatically, run `chmod +x "ChatRoute.Linux.x86_64.AppImage"` once. The app does not install startup items and does not run in the background automatically.
 
 Later, use `Help -> Check for Updates` to manually check GitHub Releases for a newer version. The MVP only opens the download page; it does not silently replace the local app.
 
