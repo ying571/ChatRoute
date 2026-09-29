@@ -24,6 +24,7 @@ jobs:
             manifest_name: latest-macos.json
             intel_manifest_name: latest-macos-intel.json
     env:
+      HAS_APPLE_CODESIGN: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 != '' && secrets.APPLE_CODESIGN_IDENTITY != '' }}
       MACOS_FILE_SLUG: ${{ matrix.file_slug }}
       MACOS_ASSET_KEY: ${{ matrix.asset_key }}
       MACOS_SPARKLE_KEY: ${{ matrix.sparkle_key }}
@@ -49,7 +50,7 @@ jobs:
           rm -rf target/release/wxdragon_sys_cmake_build
 
       - name: Import Developer ID Certificate
-        if: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 != '' && secrets.APPLE_CODESIGN_IDENTITY != '' }}
+        if: env.HAS_APPLE_CODESIGN == 'true'
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
