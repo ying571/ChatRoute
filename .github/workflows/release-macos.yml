@@ -100,7 +100,7 @@ jobs:
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             APP_VERSION="$GITHUB_REF_NAME"
           else
-            APP_VERSION="V1.0"
+            APP_VERSION="v1.3"
           fi
           {
             echo "APP_VERSION=$APP_VERSION"

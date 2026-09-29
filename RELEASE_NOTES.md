@@ -1,4 +1,4 @@
-ChatRoute（同步 CodexHub v0.4.29）
+ChatRoute v1.3（同步 CodexHub v0.4.29）
 
 本次同步新增 ChatGPT 账号渠道、OpenAI Responses WebSocket 转发，并更新 GPT 模型目录及 Codex 配置诊断。
 

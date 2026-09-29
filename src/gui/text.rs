@@ -34,7 +34,7 @@ pub(super) struct GuiText {
     pub(super) locale: GuiLocale,
 }
 
-pub(super) const DISPLAY_VERSION: &str = "V1.0";
+pub(super) const DISPLAY_VERSION: &str = "V1.3";
 
 impl GuiText {
     pub(super) fn chatgpt_channel(self) -> &'static str {
