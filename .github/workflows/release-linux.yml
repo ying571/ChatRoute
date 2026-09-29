@@ -76,7 +76,7 @@ jobs:
           cp target/release/chatroute "$PACKAGE_DIR/bin/chatroute"
           cp packaging/linux/chatroute.desktop "$PACKAGE_DIR/share/applications/chatroute.desktop"
           cp packaging/icons/dolphin-rounded-256.png "$PACKAGE_DIR/share/icons/hicolor/256x256/apps/chatroute.png"
-          cp README.md README.en.md "$PACKAGE_DIR/"
+          cp README.md "$PACKAGE_DIR/"
           if [ -f config.example.toml ]; then
             cp config.example.toml "$PACKAGE_DIR/"
           fi
