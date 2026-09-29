@@ -5,3 +5,7 @@
 - 新增 GPT-6-Astra，同步 GPT-5.5 和 GPT-5.6 系列最新模型配置。
 - 整理 GPT 模型列表，移除 GPT-5.4 和 GPT-5.4-mini。
 - 修复遗留实验渠道配置导致启动失败的问题，原渠道配置仍会保留。
+- 同步 CodexHub 0.4.29：新增 ChatGPT 账号登录渠道，支持 OAuth、导入凭证及额度查询。
+- OpenAI API Key 与 ChatGPT 账号渠道支持 Responses WebSocket，可在 Codex 初始化中按需启用。
+- 新增 GPT-6-Sol、GPT-6-Luna，同步 GPT 模型目录、搜索及模型发现配置。
+- Codex 配置状态判断更准确，请求详情可查看脱敏的上游响应头。

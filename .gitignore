@@ -1,8 +1,10 @@
 /target
 /target-verify
 /outputs
+/Codex WorkSpace/
 .DS_Store
 config.toml
+chatgpt-auth/
 chatroute-state.json
 *.log
 .im/

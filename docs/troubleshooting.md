@@ -67,6 +67,14 @@ Use a local ChatGPT-shaped auth record:
 
 The third-party model key does not satisfy this check. It belongs in the model provider config and is used later for model calls.
 
+`chatgpt_base_url` does not redirect OAuth refresh requests. Codex defaults to
+`https://auth.openai.com/oauth/token`; the existing local `/oauth/token` endpoint
+only handles step-up authorization-code exchange. The current `chatgptAuthTokens`
+mode uses externally managed tokens rather than managed ChatGPT OAuth refresh.
+The previous local `chatgpt` mode can still attempt refresh on a 401 before migration.
+Neither mode bypasses workspace routing or plugin authentication checks.
+See [authentication notes](auth-notes.zh-CN.md) for these limitations.
+
 ## Feishu Does Not Receive Messages
 
 Check:

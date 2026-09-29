@@ -61,7 +61,11 @@ pub fn resolve_provider_with_state_for_type<'a>(
         config,
         state,
         now,
-        |provider| &provider.provider_type == provider_type,
+        |provider| {
+            &provider.provider_type == provider_type
+                || (provider_type == &ProviderType::OpenAiResponses
+                    && provider.provider_type.is_openai())
+        },
         &[],
     )
 }

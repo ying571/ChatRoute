@@ -1,3 +1,27 @@
+ChatRoute（同步 CodexHub v0.4.29）
+
+本次同步新增 ChatGPT 账号渠道、OpenAI Responses WebSocket 转发，并更新 GPT 模型目录及 Codex 配置诊断。
+
+## ChatGPT 账号渠道
+
+- 支持浏览器 OAuth 登录或导入 Codex `auth.json`，多个账号可分别建为渠道。
+- 凭证独立保存在 ChatRoute 用户数据目录的 `chatgpt-auth` 文件夹；导入时复制凭证，不覆盖来源文件。
+- 支持账号模型、套餐和额度查询，以及令牌刷新与有限重试；缺失信息明确显示为未提供。
+
+## Responses WebSocket
+
+- OpenAI API Key 与 ChatGPT 账号渠道支持原生 WebSocket 转发，沿用渠道优先级和会话粘性。
+- 「Codex 接入 → Codex 初始化」新增「优先使用 WebSocket」，默认关闭；启用后需重启 Codex 客户端。
+- 每轮记录用量、响应事件与结束状态。其他厂商渠道继续使用现有 HTTP/SSE 链路。
+
+## 模型、配置与诊断
+
+- 新增 `gpt-6-sol` 和 `gpt-6-luna`，同步 7 个 GPT 模型的指令、能力及思考等级；新增模型要求 Codex 客户端至少为 0.155.0。
+- 补齐独立搜索与模型目录发现配置，保留用户已有的 WebSocket 选项；配置符合要求时显示「配置已更新」。
+- 请求详情增加脱敏后的上游响应头。
+
+验证：完整 GUI 测试通过 784 项、忽略 2 项；无 GUI 测试通过 744 项、忽略 2 项。实际账号权限和 WebSocket 支持以所选上游为准。
+
 ChatRoute v0.4.28
 
 本次版本新增 Kimi K3 原生 Responses 接入。
