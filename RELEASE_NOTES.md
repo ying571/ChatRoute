@@ -1,3 +1,20 @@
+ChatRoute v1.4（同步 CodexHub v0.4.30）
+
+本次同步修复 Codex 增强启动识别和 ChatGPT OAuth 回调问题，新增 GPT-6.1-Sol，并完善更新诊断。
+
+## 增强启动与登录
+
+- 修复开启 Codey 或 Codex CLI 时，增强启动误提示需要关闭 Codex App 的问题。
+- Windows 预检区分官方 Codex App 与第三方 Codex CLI、app-server 和 Codey，兼容官方桌面主程序的 Codex.exe 和 ChatGPT.exe。
+- ChatGPT OAuth 登录使用已注册的回调端口，修复端口被占用时出现授权错误的问题。
+
+## 模型与更新诊断
+
+- 新增 `gpt-6.1-sol`，同步官方 GPT 模型目录配置。
+- 更新失败时保留网络错误详情到诊断日志，帮助定位代理和连接问题。
+- 对应上游变更已覆盖模型、增强启动、OAuth 回调和 Linux 发布资产检查。
+
+验证：已完成格式检查、编译检查及相关回归测试；实际账号权限、网络环境和 Codex 客户端版本以本地配置为准。
 ChatRoute v1.3（同步 CodexHub v0.4.29）
 
 本次同步新增 ChatGPT 账号渠道、OpenAI Responses WebSocket 转发，并更新 GPT 模型目录及 Codex 配置诊断。
@@ -266,3 +283,4 @@ ChatRoute v0.4.17
 - `cargo check --features gui --bin chatroute` 通过。
 - `git diff --check` 通过。
 - GitHub Actions 将在 Windows、macOS 和 Linux 上构建并上传安装包。
+
