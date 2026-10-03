@@ -1,4 +1,4 @@
-ChatRoute v1.4（同步 CodexHub v0.4.30）
+ChatRoute v0.4.30（同步 CodexHub v0.4.30）
 
 本次同步修复 Codex 增强启动识别和 ChatGPT OAuth 回调问题，新增 GPT-6.1-Sol，并完善更新诊断。
 

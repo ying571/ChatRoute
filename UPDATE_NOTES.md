@@ -1,4 +1,4 @@
-- v1.4 同步 CodexHub 0.4.30：修复增强启动识别和 ChatGPT OAuth 回调端口问题。
+- v0.4.30 同步 CodexHub 0.4.30：修复增强启动识别和 ChatGPT OAuth 回调端口问题。
 - 新增 GPT-6.1-Sol，并同步官方模型目录配置。
 - 更新失败诊断保留网络错误详情，便于定位网络问题。
 - v1.3 同步 CodexHub 0.4.29：新增 ChatGPT 账号渠道，支持 OAuth 登录、导入凭证和额度查询。

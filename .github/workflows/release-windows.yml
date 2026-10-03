@@ -46,7 +46,7 @@ jobs:
           if ($refType -eq "tag") {
             $appVersion = $refName
           } else {
-            $appVersion = "v1.3"
+            $appVersion = "v0.4.30"
           }
 
           $productVersion = ($cargoVersion -split '[-+]')[0]
