@@ -267,7 +267,7 @@ fn is_chatroute_connection_log(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .is_some_and(|name| {
             let lower = name.to_ascii_lowercase();
-            lower.starts_with("chatroute")
+            (lower.starts_with("chatroute") || lower.starts_with("codexhub"))
                 && lower.contains(".log")
                 && !lower.contains("ai-gateway")
                 && !lower.contains("ai_gateway")
